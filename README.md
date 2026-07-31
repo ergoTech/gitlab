@@ -267,6 +267,83 @@ tar -xzf gitlab-backup-YYYYMMDD.tar.gz
 docker compose up -d
 ```
 
+### Disk maintenance
+
+Two things fill this host's disk and neither cleans up after itself:
+
+- **The container registry.** Every pipeline pushes the same `:latest` tag, which
+  leaves the previous manifest untagged. Untagged manifests and their blobs are
+  never removed unless garbage collection runs with `-m`. Left alone this reached
+  41 GB here.
+- **The runner's Docker state.** Multiarch builds leave buildkit cache and an
+  unreferenced image per pipeline — 14.85 GB of cache and 56.56 GB of images
+  (507 images, 26 of them in use).
+
+The runner shares this host's Docker daemon with the production stack
+(`/var/run/docker.sock` is mounted into it), so every cleanup here is an
+operation on production. The script therefore never touches volumes (the prod
+databases live in them), never removes containers (exited one-shots like
+`prod-migrate` hold their last logs and pin their images), and only ever prunes
+images behind an age filter — including when it escalates.
+
+When the disk fills, the registry starts answering `500 Internal Server Error` to
+`POST /v2/<image>/blobs/uploads/`. Pipelines then fail at the push step **with a
+completely green build above it**, which reads like a broken build and is not one.
+If you see that error, check `df -h /` first.
+
+Install the scheduled cleanup once:
+
+```bash
+make install-cron
+```
+
+That writes `/etc/cron.d/gitlab-maintenance`:
+
+| When | What |
+|------|------|
+| Mon–Sat 03:30 | buildkit cache, unreferenced images created over 7 days ago, archived journals |
+| Sun 03:30 | the above plus registry garbage collection |
+
+Registry GC **stops** the registry for the duration, which is why it is weekly and
+at night: a push landing in that window fails its pipeline (retry it), though it
+cannot corrupt the storage. An interrupted GC (reboot, OOM) leaves the registry
+stopped — the same 500-on-push symptom as a full disk — so the script checks
+afterwards and starts it back up, shouting in the log if it cannot.
+
+Above 85% usage a run escalates to a 1-hour age filter instead of 7 days. It stays
+a filter rather than dropping to nothing: an image a pipeline built seconds ago has
+no container referencing it until it is pushed, and sweeping it mid-pipeline would
+cause exactly the failure this script exists to prevent. For the same reason no
+pruning happens at all while a CI job is running.
+
+Note on the age filter: Docker's `until` matches image **creation** time, not last
+use. A base image pulled today can be months old by it. The window is not "keep
+what we still need" — it is only a guarantee that a just-built image survives long
+enough to be pushed.
+
+Run it by hand at any time:
+
+```bash
+make maintenance    # everything, including registry GC
+make registry-gc    # registry GC only
+```
+
+Log: `/var/log/gitlab-maintenance.log` (self-trimming at 10 MB).
+
+The run exits non-zero if any step failed and prints nothing on success, so cron
+mail (`MAILTO`, default `root`) means something actually broke.
+
+Tune via environment variables: `IMAGE_RETENTION` (default `168h`),
+`ESCALATION_RETENTION` (`1h`), `DISK_ESCALATE_PCT` (`85`), `MAINTENANCE_LOG`,
+`MAINTENANCE_LOCK`, `GITLAB_CONTAINER`. Set the cron recipient with
+`make install-cron MAINTENANCE_MAILTO=you@example.com`.
+
+**Not covered by this script**, and worth doing separately: the root cause is that
+pipelines push only `:latest`, so every build orphans the previous manifest. Tagging
+by `$CI_COMMIT_SHA` plus a registry cleanup policy would leave GC almost nothing to
+do — and would give real rollback tags. Job artifacts and runner cache volumes also
+have no expiry.
+
 ## Troubleshooting
 
 ### GitLab not starting

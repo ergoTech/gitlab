@@ -1,7 +1,10 @@
-.PHONY: help up down restart logs logs-gitlab logs-runner status ps clean backup restore get-password register-runner health
+.PHONY: help up down restart logs logs-gitlab logs-runner status ps clean backup restore get-password register-runner health registry-gc maintenance install-cron
 
 # Default target
 .DEFAULT_GOAL := help
+
+# Address that cron mails when a maintenance run fails. Empty disables mail.
+MAINTENANCE_MAILTO ?= root
 
 # Colors
 YELLOW := \033[1;33m
@@ -116,3 +119,29 @@ prune: ## Remove unused Docker resources
 	docker system prune -f
 	@echo "$(GREEN)Prune complete!$(NC)"
 
+
+registry-gc: maintenance ## Alias for maintenance (registry GC runs through the same lock)
+
+maintenance: ## Run the full disk maintenance pass now (docker + journal + registry GC)
+	@echo "$(YELLOW)Running maintenance...$(NC)"
+	sudo -E ./scripts/maintenance.sh --with-registry-gc
+	@echo "$(GREEN)Maintenance complete!$(NC)"
+
+install-cron: ## Install the scheduled maintenance (daily docker cleanup, weekly registry GC)
+	@echo "$(YELLOW)Installing /etc/cron.d/gitlab-maintenance...$(NC)"
+	@printf '%s\n' \
+		'# Disk maintenance for the GitLab host - installed by `make install-cron`.' \
+		'# Edit scripts/maintenance.sh in the repo, not this file.' \
+		'SHELL=/bin/bash' \
+		'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+		'# Only failures produce output, so mail means something is wrong.' \
+		'MAILTO=$(MAINTENANCE_MAILTO)' \
+		'' \
+		'30 3 * * 1-6 root $(CURDIR)/scripts/maintenance.sh' \
+		'30 3 * * 0 root $(CURDIR)/scripts/maintenance.sh --with-registry-gc' \
+		'' | sudo tee /etc/cron.d/gitlab-maintenance > /dev/null
+	@sudo chmod 644 /etc/cron.d/gitlab-maintenance
+	@echo "$(GREEN)Installed. Schedule:$(NC)"
+	@echo "  Mon-Sat 03:30  docker cache + old images + journal"
+	@echo "  Sun     03:30  the above plus registry garbage collection"
+	@echo "  Log: /var/log/gitlab-maintenance.log"
