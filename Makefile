@@ -134,11 +134,12 @@ install-cron: ## Install the scheduled maintenance (daily docker cleanup, weekly
 		'# Edit scripts/maintenance.sh in the repo, not this file.' \
 		'SHELL=/bin/bash' \
 		'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
-		'# Only failures produce output, so mail means something is wrong.' \
+		'# stdout is discarded per entry — keep the >/dev/null on any line you add.' \
+		'# Only stderr (failures) reaches mail.' \
 		'MAILTO=$(MAINTENANCE_MAILTO)' \
 		'' \
-		'30 3 * * 1-6 root $(CURDIR)/scripts/maintenance.sh' \
-		'30 3 * * 0 root $(CURDIR)/scripts/maintenance.sh --with-registry-gc' \
+		'30 3 * * 1-6 root $(CURDIR)/scripts/maintenance.sh >/dev/null' \
+		'30 3 * * 0 root $(CURDIR)/scripts/maintenance.sh --with-registry-gc >/dev/null' \
 		'' | sudo tee /etc/cron.d/gitlab-maintenance > /dev/null
 	@sudo chmod 644 /etc/cron.d/gitlab-maintenance
 	@echo "$(GREEN)Installed. Schedule:$(NC)"

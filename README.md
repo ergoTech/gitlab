@@ -291,11 +291,17 @@ When the disk fills, the registry starts answering `500 Internal Server Error` t
 completely green build above it**, which reads like a broken build and is not one.
 If you see that error, check `df -h /` first.
 
-Install the scheduled cleanup once:
+Install the scheduled cleanup:
 
 ```bash
 make install-cron
 ```
+
+**Re-run it after any update that touches `scripts/maintenance.sh` or the cron
+entries.** The installed `/etc/cron.d/gitlab-maintenance` is a snapshot, not a
+symlink: pulling a new script without re-installing leaves the old entries in
+place, and the mismatch is silent — the nightly run keeps working but stops
+being quiet, mailing root every morning about a success.
 
 That writes `/etc/cron.d/gitlab-maintenance`:
 
@@ -330,8 +336,10 @@ make registry-gc    # registry GC only
 
 Log: `/var/log/gitlab-maintenance.log` (self-trimming at 10 MB).
 
-The run exits non-zero if any step failed and prints nothing on success, so cron
-mail (`MAILTO`, default `root`) means something actually broke.
+A run prints its progress to stdout and appends it to the log. The cron entries
+redirect stdout to `/dev/null`, so a scheduled run is silent unless it fails —
+failures go to stderr and the exit code is non-zero, which is what makes cron
+mail (`MAILTO`, default `root`) mean something actually broke.
 
 Tune via environment variables: `IMAGE_RETENTION` (default `168h`),
 `ESCALATION_RETENTION` (`1h`), `DISK_ESCALATE_PCT` (`85`), `MAINTENANCE_LOG`,

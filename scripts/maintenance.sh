@@ -33,8 +33,10 @@
 #   ./scripts/maintenance.sh                     # docker + journal only
 #   ./scripts/maintenance.sh --with-registry-gc  # everything
 #
-# Exit code is non-zero if any step failed, so cron mails and any monitoring
-# that watches exit status actually learns about it.
+# Exit code is non-zero if any step failed, so monitoring that watches exit
+# status learns about it. Cron mails for a different reason — it mails on
+# OUTPUT, and the failure line goes to stderr while the cron entries discard
+# stdout.
 
 set -euo pipefail
 
@@ -111,7 +113,7 @@ run_registry_gc() {
     fi
 
     log "Running registry garbage collection (registry stops for the duration)..."
-    if docker exec "$GITLAB_CONTAINER" gitlab-ctl registry-garbage-collect -m >>"$LOG_FILE" 2>&1; then
+    if docker exec "$GITLAB_CONTAINER" gitlab-ctl registry-garbage-collect -m 2>&1; then
         log "${GREEN}Registry GC done${NC}"
     else
         fail "Registry GC FAILED — see $LOG_FILE"
@@ -125,7 +127,7 @@ run_registry_gc() {
         return
     fi
     fail "Registry is DOWN after GC — starting it"
-    if docker exec "$GITLAB_CONTAINER" gitlab-ctl start registry >>"$LOG_FILE" 2>&1 && registry_running; then
+    if docker exec "$GITLAB_CONTAINER" gitlab-ctl start registry 2>&1 && registry_running; then
         log "${GREEN}Registry restarted${NC}"
     else
         fail "Could not restart the registry — PUSHES ARE FAILING, fix by hand: docker exec $GITLAB_CONTAINER gitlab-ctl start registry"
@@ -206,9 +208,10 @@ exec 9>"$LOCK_FILE"
 lock_rc=0
 flock -n 9 || lock_rc=$?
 if [ "$lock_rc" -eq 1 ]; then
-    # Into the log, not just stdout: a run that always skips is indistinguishable
-    # from a cron that never fires if it leaves no trace where anyone looks.
-    log "Another maintenance run holds the lock — exiting" >>"$LOG_FILE"
+    # Both stdout and the log. A run that always skips is indistinguishable from
+    # a cron that never fires if it leaves no trace where anyone looks — and a
+    # hand-run that prints nothing is the very confusion this script just fixed.
+    log "Another maintenance run holds the lock — exiting" | tee -a "$LOG_FILE"
     exit 0
 elif [ "$lock_rc" -ne 0 ]; then
     log "Could not acquire lock ($LOCK_FILE): flock exited $lock_rc" | tee -a "$LOG_FILE" >&2
@@ -221,21 +224,32 @@ if [ -f "$LOG_FILE" ] && [ "$(stat -c %s "$LOG_FILE")" -gt "$LOG_MAX_BYTES" ]; t
     trimmed=$(tail -c $((LOG_MAX_BYTES / 2)) "$LOG_FILE") && printf '%s\n' "$trimmed" >"$LOG_FILE"
 fi
 
-if [ -t 1 ]; then
-    # A pipeline puts main in a subshell, so its FAILED never reaches here —
-    # take the status off PIPESTATUS instead of reading the variable.
-    set +e
-    main 2>&1 | tee -a "$LOG_FILE"
-    FAILED=${PIPESTATUS[0]}
-    set -e
-else
-    # Non-interactive (cron): the log file is the record, and stdout stays empty
-    # so cron only mails when something actually went wrong. No pipeline here,
-    # so main runs in this shell and sets FAILED directly.
-    main >>"$LOG_FILE" 2>&1 || FAILED=1
-    if [ "$FAILED" -ne 0 ]; then
-        echo "gitlab maintenance finished with failures — see $LOG_FILE" >&2
-    fi
+# Output always goes to stdout AND the log; the cron entries redirect stdout to
+# /dev/null themselves. Deciding this from `[ -t 1 ]` was worse than it looked:
+# `ssh host './maintenance.sh'` has no TTY either, so a hand-run over ssh went
+# completely silent and looked like it had done nothing.
+#
+# A pipeline puts main in a subshell, so its FAILED never reaches here — take
+# the status off PIPESTATUS instead of reading the variable.
+set +e
+main 2>&1 | tee -a "$LOG_FILE"
+# Copied as a whole array in one command: any assignment is itself a command
+# and resets PIPESTATUS, so reading [0] and [1] on separate statements makes
+# the second one read the wrong array — under `set -u` that is an unbound
+# variable and the script dies right where it is meant to report a result.
+pipe_rc=("${PIPESTATUS[@]}")
+set -e
+FAILED=${pipe_rc[0]}
+if [ "${pipe_rc[1]:-0}" -ne 0 ]; then
+    # The log is the only record a scheduled run leaves; losing it silently
+    # would make every later "it ran fine" unverifiable.
+    echo "could not write $LOG_FILE" >&2
+    FAILED=1
+fi
+
+# stderr, so cron mails this even with stdout redirected away.
+if [ "$FAILED" -ne 0 ]; then
+    echo "gitlab maintenance finished with failures — see $LOG_FILE" >&2
 fi
 
 exit "$FAILED"
