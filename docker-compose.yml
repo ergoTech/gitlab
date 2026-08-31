@@ -13,7 +13,7 @@ services:
   # GITLAB CE SERVER
   # ===========================================
   gitlab:
-    image: gitlab/gitlab-ce:latest
+    image: gitlab/gitlab-ce:18.6.1-ce.0
     container_name: gitlab
     hostname: ${GITLAB_HOSTNAME:-gitlab.local}
     restart: unless-stopped
