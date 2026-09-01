@@ -14,15 +14,20 @@
 #      unreferenced image per pipeline: 14.85 GB of cache and 56 GB of images
 #      from 507 images of which 26 were in use.
 #
-# IMPORTANT: the runner shares this host's Docker daemon with the production
-# stack (see docker-compose.yml — /var/run/docker.sock is mounted into the
-# runner). Everything here is therefore an operation on production, and is
-# deliberately conservative:
-#   - volumes are never touched (prod-mongodb, prod-qdrant and prod-redis data
-#     live in them);
-#   - containers are never removed (exited one-shots like prod-migrate and
-#     stage-migrate are kept on purpose — they hold the last run's logs, and
-#     removing them would also unpin their images);
+# IMPORTANT: /var/run/docker.sock is mounted into the runner, so everything here
+# operates on whatever else shares that daemon. On the original host that was the
+# production stack itself — which is where the caution below comes from, and why
+# it is kept even though the GitLab host this now runs on has nothing but gitlab
+# and gitlab-runner on its daemon. Deliberately conservative:
+#   - NAMED volumes are never touched (prod-mongodb, prod-qdrant and prod-redis
+#     data live in them, as do the runner's caches). The anonymous volumes of a
+#     removed CI build container go with it — `docker rm -v` cannot reach a
+#     named volume, so this is bounded to the container's own scratch;
+#   - containers are removed in ONE case only: a CI build container (name
+#     `runner-*`) that exited longer ago than BUILD_CONTAINER_RETENTION_HOURS.
+#     Everything else is kept, including exited one-shots such as prod-migrate
+#     and stage-migrate on a host that has them — they hold their last run's
+#     logs, and removing them would unpin their images;
 #   - images are only ever pruned with an age filter, so an image built seconds
 #     ago by a running pipeline and not yet pushed cannot be swept from under it.
 #
@@ -61,6 +66,18 @@ IMAGE_RETENTION="${IMAGE_RETENTION:-168h}"
 # longer than any build-to-push gap here and still sweeps everything old.
 ESCALATION_RETENTION="${ESCALATION_RETENTION:-1h}"
 
+# Hours after a CI build container EXITS before it may be removed. A number of
+# hours rather than a docker duration string, unlike its neighbours above,
+# because `docker ps` has no `until` filter — the age has to be computed here.
+#
+# Eight, not twenty-four, because this is sampled by a 03:30 cron: a window of N
+# hours means anything that died after 03:30-N waits for the NEXT night, so 24
+# really means 24-48. The ten containers that prompted this function were 11-16
+# hours old at the following run and a 24h window would have skipped every one
+# of them. Nothing needs a long window here: ci_job_running already holds off
+# while any job is live, and the runner is concurrent = 1.
+BUILD_CONTAINER_RETENTION_HOURS="${BUILD_CONTAINER_RETENTION_HOURS:-8}"
+
 # Above this usage the routine pass is not enough and the run escalates.
 DISK_ESCALATE_PCT="${DISK_ESCALATE_PCT:-85}"
 
@@ -70,7 +87,11 @@ WITH_REGISTRY_GC=false
 for arg in "$@"; do
     case "$arg" in
         --with-registry-gc) WITH_REGISTRY_GC=true ;;
-        -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
+        # Everything from line 2 to the first non-comment line, computed rather
+        # than hardcoded: the previous `sed -n '2,36p'` silently stopped covering
+        # --with-registry-gc the moment the header grew by three lines, so --help
+        # stopped documenting the flag the Sunday cron uses.
+        -h|--help) awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0"; exit 0 ;;
         *) echo "Unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -100,6 +121,100 @@ disk_line() {
 # keep working.
 ci_job_running() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^runner-'
+}
+
+# GitLab Runner removes its own build containers when a job ends. Ones that
+# survive are from a job that did NOT end — a killed runner, a restarted daemon
+# — and they are not merely debris: an exited container still references the
+# images it used, so the image prune below cannot touch those images while it is
+# here. Measured on the GitLab host, 2026-09-01, ten leftovers from two
+# interrupted builds. `docker system df` before and after removing them:
+#
+#   Containers   4.156GB / 4.149GB reclaimable  ->  6.595MB / 0B
+#   Images      13.76GB  / 3.858GB reclaimable  -> 13.76GB  / 6.87GB
+#
+# Two effects, worth not conflating: 4.15 GB of container layers is freed
+# outright by the removal, and a further ~3.0 GB of images stops being pinned.
+# Only the first is a reclaim; the second is a reclassification that the prune
+# below may or may not act on, depending on its age filter.
+#
+# Deliberately narrow, and each half of the filter earns its place:
+#   - `^runner-` only, so the exited one-shots this script has always protected
+#     (prod-migrate and friends on a host that shares its daemon with production)
+#     and the buildx builders reported further down are both untouched;
+#   - exited only, so nothing a live job owns is in scope;
+#   - older than the window, so a job whose helper is still uploading artifacts
+#     is safe even if ci_job_running has already gone false.
+remove_abandoned_build_containers() {
+    local cutoff now hours finished fin_epoch rm_err removed=0 skipped=0 c
+
+    # Validated rather than trusted, because this one is arithmetic: a value
+    # like `24h` — the format both neighbouring knobs use — would abort the
+    # whole run under `set -u`, taking the image prune, the journal vacuum and
+    # the registry restart-if-down safety net with it. A bad IMAGE_RETENTION
+    # only ever fails its own docker call.
+    # Three shapes are rejected, and the second two are not pedantry:
+    #   - non-numeric, the `24h` typo the neighbouring knobs invite;
+    #   - seven digits or more, which is 114 years and up. That is a nonsense
+    #     window on its own, but the cap is also where the arithmetic stops
+    #     being trustworthy: measured in bash, 7 to 15 digits drive the cutoff
+    #     deeply negative and fail CLOSED (everything is skipped), while from 16
+    #     digits `H * 3600` wraps int64 and the cutoff lands in the FUTURE — the
+    #     guard fails OPEN and sweeps containers that exited seconds ago.
+    # A leading zero is not rejected but normalised below: `$(( 08 ))` is an
+    # octal error that would abort the whole run, and `$(( 010 ))` is a silent 8.
+    case "$BUILD_CONTAINER_RETENTION_HOURS" in
+        ''|*[!0-9]*|???????*)
+            fail "BUILD_CONTAINER_RETENTION_HOURS must be a whole number of hours, at most 6 digits, got '${BUILD_CONTAINER_RETENTION_HOURS}' — skipping this step"
+            return
+            ;;
+    esac
+
+    # 10# forces base ten. Logged from `hours`, not from the raw variable, so the
+    # message cannot say 010h while the arithmetic uses 8.
+    hours=$(( 10#$BUILD_CONTAINER_RETENTION_HOURS ))
+    now=$(date +%s)
+    cutoff=$(( now - hours * 3600 ))
+
+    for c in $(docker ps -aq --filter 'name=^runner-' --filter 'status=exited' 2>/dev/null); do
+        finished=$(docker inspect "$c" --format '{{.State.FinishedAt}}' 2>/dev/null) || continue
+        # Note what does NOT protect a never-run container here: GNU date parses
+        # the zero timestamp 0001-01-01T00:00:00Z happily (it returns
+        # -62135596800 with status 0), so this would sail past any cutoff. What
+        # keeps them out is `status=exited` in the filter above — a container
+        # that never ran is `created`, not `exited`. If that filter is ever
+        # widened, this needs a zero-timestamp guard of its own.
+        #
+        # The residual case is an exited container whose FinishedAt is zero
+        # because the daemon died mid-write — the very scenario this function
+        # exists for. It would be removed regardless of age. Deliberate: it is
+        # abandoned by definition, and ci_job_running already guards live work.
+        fin_epoch=$(date -d "$finished" +%s 2>/dev/null) || continue
+        if [ "$fin_epoch" -ge "$cutoff" ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        if rm_err=$(docker rm -v "$c" 2>&1 >/dev/null); then
+            removed=$((removed + 1))
+        else
+            case "$rm_err" in
+                # The runner reaping its own container between the listing and
+                # this line is normal, not a failure worth waking anyone for.
+                *"No such container"*) : ;;
+                *) fail "could not remove abandoned CI build container $c: $rm_err" ;;
+            esac
+        fi
+    done
+
+    if [ "$removed" -gt 0 ]; then
+        log "Removed ${removed} abandoned CI build container(s) that exited over ${hours}h ago"
+    fi
+    # Reported even when nothing was removed, matching the buildx block further
+    # down: an admin asking why the disk is full should not have to infer that
+    # this step ran and declined.
+    if [ "$skipped" -gt 0 ]; then
+        log "${YELLOW}${skipped} exited CI build container(s) younger than ${hours}h — left alone${NC}"
+    fi
 }
 
 registry_running() {
@@ -141,6 +256,10 @@ main() {
     if ci_job_running; then
         log "${YELLOW}A CI job is running — skipping image pruning this pass${NC}"
     else
+        # Before the prunes, not after: removing these is what makes the images
+        # they were holding eligible in this same run rather than the next one.
+        remove_abandoned_build_containers
+
         log "Pruning buildkit cache older than ${IMAGE_RETENTION}..."
         docker builder prune -af --filter "until=${IMAGE_RETENTION}" >/dev/null 2>&1 ||
             fail "builder prune failed"
