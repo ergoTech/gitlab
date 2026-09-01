@@ -143,6 +143,18 @@ nano .env
 **Update these values:**
 ```bash
 GITLAB_HOSTNAME=git.yourdomain.com
+# Cloudflare terminates TLS, so GitLab has to be told https - without this it
+# generates http:// clone URLs and links. Note it also makes the session cookie
+# Secure, so http://<host> stops being usable for login.
+GITLAB_EXTERNAL_SCHEME=https
+# Internal container hostname. Required once the scheme is https: Docker
+# publishes this name to the whole network, so leaving it as the public name
+# makes anything on that network - CI job containers registered by
+# scripts/register-runner.sh among them - resolve it to the GitLab container
+# and try 443, where its nginx does not listen. (A runner using
+# network_per_build with an explicit clone_url is not affected either way.)
+# On a plain-http setup you leave this unset instead - see .env.sample.
+GITLAB_CONTAINER_HOSTNAME=gitlab
 GITLAB_SSH_HOST=git-ssh.yourdomain.com
 GITLAB_SSH_PORT=22
 GITLAB_SSH_EXTERNAL_PORT=22
