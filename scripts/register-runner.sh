@@ -12,15 +12,42 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Load environment variables
+# Run from the repository root, so .env is found however the script is invoked
+cd "$(dirname "$0")/.."
+
+# Load environment variables. Sourcing rather than `export $(... | xargs)`: the
+# latter drops EVERY variable on the first quote or inline comment in .env, and
+# a bare `export` then succeeds while setting nothing - so the https branch
+# below would silently register the http configuration.
 if [ -f .env ]; then
-    export $(grep -v '^#' .env | xargs)
+    if ! bash -n ./.env 2>/dev/null; then
+        echo -e "${RED}Error: .env cannot be parsed${NC}"
+        echo "A value containing a quote or a space has to be quoted, e.g. PASS='don'\''t' or PASS=\"a b\"."
+        echo "Refusing to continue: an unreadable .env would look like an empty one and register the wrong runner."
+        exit 1
+    fi
+    set -a
+    . ./.env
+    set +a
 fi
 
 # Default values
 GITLAB_URL="http://${GITLAB_HOSTNAME:-gitlab.local}"
 RUNNER_NAME="${RUNNER_DESCRIPTION:-docker-runner}"
 RUNNER_TAGS="${RUNNER_TAGS:-docker,linux,arm64}"
+
+# Same knob as GITLAB_EXTERNAL_SCHEME in .env.sample, normalised and checked
+# here because the whole registration shape hangs off it.
+EXTERNAL_SCHEME=$(echo "${GITLAB_EXTERNAL_SCHEME:-http}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+if [ "$EXTERNAL_SCHEME" != "http" ] && [ "$EXTERNAL_SCHEME" != "https" ]; then
+    echo -e "${RED}Error: GITLAB_EXTERNAL_SCHEME must be http or https, got '${GITLAB_EXTERNAL_SCHEME}'${NC}"
+    exit 1
+fi
+if [ "$EXTERNAL_SCHEME" = "https" ] && [ -z "${GITLAB_HOSTNAME}" ]; then
+    echo -e "${RED}Error: GITLAB_EXTERNAL_SCHEME=https needs GITLAB_HOSTNAME set${NC}"
+    echo "The runner clones from https://\$GITLAB_HOSTNAME; empty means every job fails at checkout."
+    exit 1
+fi
 
 echo -e "${YELLOW}=== GitLab Runner Registration ===${NC}"
 echo ""
@@ -109,6 +136,54 @@ echo ""
 echo -e "${YELLOW}Registering runner with GitLab...${NC}"
 echo ""
 
+# How job containers reach GitLab depends on whether a proxy in front terminates
+# TLS.
+#
+# http (local): jobs join gitlab-network and clone external_url directly, so the
+# public name has to resolve to the gitlab container. --docker-network-mode is
+# what puts them there.
+#
+# https (proxy in front): the clone URL is public, so jobs have no reason to sit
+# on gitlab-network - give each job its own network instead. The explicit
+# --clone-url is the load-bearing half: with it left out the job clones whatever
+# GitLab advertises, and a proxy that redirects http -> https makes git drop the
+# Authorization header on the redirect. The job token is then gone by the time
+# GitLab sees the request, and the clone dies with "HTTP Basic: Access denied"
+# and exit code 128, which reads like a broken token and is nothing of the sort.
+if [ "$EXTERNAL_SCHEME" = "https" ]; then
+    REGISTER_NETWORK_ARGS=(
+        --env "FF_NETWORK_PER_BUILD=true"
+        --clone-url "https://${GITLAB_HOSTNAME}"
+    )
+    NETWORK_SUMMARY="per-build (clone URL: https://${GITLAB_HOSTNAME})"
+else
+    REGISTER_NETWORK_ARGS=(--docker-network-mode "gitlab-network")
+    NETWORK_SUMMARY="gitlab-network (clone URL: whatever GitLab advertises)"
+fi
+echo -e "${YELLOW}Job network:${NC} ${NETWORK_SUMMARY}"
+echo ""
+
+# Service containers inherit the docker DAEMON's soft nofile limit. The runner's
+# own ulimit setting does not help: gitlab-runner applies it to the build
+# container and not to services. A systemd default of 1024 is enough for mongod
+# to start and not enough for it to survive - it exhausts descriptors mid-job,
+# WiredTiger panics on a directory sync (EMFILE), the container exits 133, and
+# the job sees only a database that stopped answering. So warn here and fix it
+# on the daemon.
+DAEMON_NOFILE=$(docker run --rm alpine:latest sh -c 'ulimit -Sn' 2>/dev/null || echo "")
+if [ -z "$DAEMON_NOFILE" ]; then
+    echo -e "${YELLOW}Warning: could not determine the daemon's nofile limit.${NC}"
+    echo "Check it by hand - this is the only thing standing between a database"
+    echo "service container and a mid-job crash. See default-ulimits in daemon.json."
+    echo ""
+elif [ "$DAEMON_NOFILE" != "unlimited" ] && [ "$DAEMON_NOFILE" -lt 64000 ] 2>/dev/null; then
+    echo -e "${YELLOW}Warning: containers start with a soft nofile limit of ${DAEMON_NOFILE}.${NC}"
+    echo "Database service containers (mongo, postgres) need roughly 64000 and will"
+    echo "die mid-job without it. Add this to /etc/docker/daemon.json and restart docker:"
+    echo '  "default-ulimits": { "nofile": { "Name": "nofile", "Soft": 64000, "Hard": 524288 } }'
+    echo ""
+fi
+
 docker exec gitlab-runner gitlab-runner register \
     --non-interactive \
     --url "http://gitlab" \
@@ -118,7 +193,7 @@ docker exec gitlab-runner gitlab-runner register \
     --docker-privileged \
     --docker-volumes "/var/run/docker.sock:/var/run/docker.sock" \
     --docker-volumes "/cache" \
-    --docker-network-mode "gitlab-network"
+    "${REGISTER_NETWORK_ARGS[@]}"
 
 if [ $? -eq 0 ]; then
     echo ""
@@ -147,7 +222,7 @@ if [ $? -eq 0 ]; then
     echo "  • Executor: Docker (with socket mounting)"
     echo "  • Default image: alpine:latest"
     echo "  • Privileged mode: Enabled"
-    echo "  • Network: gitlab-network"
+    echo "  • Job network: ${NETWORK_SUMMARY}"
     echo "  • Docker socket: Mounted from host"
     echo ""
     echo -e "${YELLOW}View runner status:${NC}"
