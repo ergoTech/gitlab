@@ -279,12 +279,16 @@ Two things fill this host's disk and neither cleans up after itself:
   unreferenced image per pipeline — 14.85 GB of cache and 56.56 GB of images
   (507 images, 26 of them in use).
 
-The runner shares this host's Docker daemon with the production stack
-(`/var/run/docker.sock` is mounted into it), so every cleanup here is an
-operation on production. The script therefore never touches volumes (the prod
-databases live in them), never removes containers (exited one-shots like
-`prod-migrate` hold their last logs and pin their images), and only ever prunes
-images behind an age filter — including when it escalates.
+`/var/run/docker.sock` is mounted into the runner, so every cleanup here
+operates on whatever else shares that daemon. On the original host that was the
+production stack itself, which is where this caution comes from; the GitLab-only
+host it runs on now has nothing but `gitlab` and `gitlab-runner`, and the caution
+is kept anyway. The script therefore never touches named volumes (prod databases
+where they exist, and the runner caches, live in them), removes containers in one
+case only — a CI build container named `runner-*` that exited over
+`BUILD_CONTAINER_RETENTION_HOURS` ago, together with its own anonymous volumes,
+while exited one-shots like `prod-migrate` are kept for their logs — and only
+ever prunes images behind an age filter, including when it escalates.
 
 When the disk fills, the registry starts answering `500 Internal Server Error` to
 `POST /v2/<image>/blobs/uploads/`. Pipelines then fail at the push step **with a
@@ -307,7 +311,7 @@ That writes `/etc/cron.d/gitlab-maintenance`:
 
 | When | What |
 |------|------|
-| Mon–Sat 03:30 | buildkit cache, unreferenced images created over 7 days ago, archived journals |
+| Mon–Sat 03:30 | abandoned CI build containers, buildkit cache, unreferenced images created over 7 days ago, archived journals |
 | Sun 03:30 | the above plus registry garbage collection |
 
 Registry GC **stops** the registry for the duration, which is why it is weekly and
@@ -342,8 +346,9 @@ failures go to stderr and the exit code is non-zero, which is what makes cron
 mail (`MAILTO`, default `root`) mean something actually broke.
 
 Tune via environment variables: `IMAGE_RETENTION` (default `168h`),
-`ESCALATION_RETENTION` (`1h`), `DISK_ESCALATE_PCT` (`85`), `MAINTENANCE_LOG`,
-`MAINTENANCE_LOCK`, `GITLAB_CONTAINER`. Set the cron recipient with
+`ESCALATION_RETENTION` (`1h`), `BUILD_CONTAINER_RETENTION_HOURS` (`8`, a bare
+number of hours — not a docker duration string), `DISK_ESCALATE_PCT` (`85`),
+`MAINTENANCE_LOG`, `MAINTENANCE_LOCK`, `GITLAB_CONTAINER`. Set the cron recipient with
 `make install-cron MAINTENANCE_MAILTO=you@example.com`.
 
 **Not covered by this script**, and worth doing separately: the root cause is that
