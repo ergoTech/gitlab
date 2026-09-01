@@ -38,14 +38,22 @@ services:
         # they are not interchangeable: listen_port picks the port (80, so not
         # 443), and listen_https = false decides whether that port speaks TLS.
         # Drop the second with the scheme at https and `@https` flips for the
-        # whole server block: omnibus stops seeing listen_https as false, decides
-        # Let's Encrypt should be on, and tries to issue a certificate for the
-        # public name on a host that never asked for one. Without a certificate
-        # nginx will not start at all; with one it renders `listen *:80 ssl;` and
-        # the proxy then talks plain HTTP at a TLS port, so every request is a
-        # 400. Setting this to https changes real behaviour,
-        # not just generated links - read GITLAB_EXTERNAL_SCHEME in .env.sample
-        # before you touch it.
+        # whole server block: nginx renders `listen *:80 ssl;` and wants a
+        # certificate at /etc/gitlab/ssl/<hostname>.crt, which does not exist
+        # here because the proxy holds the certificate. nginx then refuses to
+        # start at all, so the symptom is a container that never turns healthy,
+        # not an error page.
+        #
+        # Let's Encrypt stays off through two independent guards, and only one
+        # of them is obvious. Omnibus auto-enables it when letsencrypt['enable']
+        # is nil AND the scheme is https AND listen_https is not false, so both
+        # the explicit letsencrypt['enable'] = false and the listen_https = false
+        # below suppress it on their own. Remove one and Let's Encrypt still
+        # stays off (though removing listen_https costs you nginx, above);
+        # remove both and it tries to issue a certificate for the public name on
+        # a host that never asked for one. Setting this to https changes real
+        # behaviour, not just generated links - read GITLAB_EXTERNAL_SCHEME in
+        # .env.sample before you touch it.
         external_url '${GITLAB_EXTERNAL_SCHEME:-http}://${GITLAB_HOSTNAME:-gitlab.local}'
 
         # SSH settings
@@ -124,7 +132,10 @@ services:
         max-file: "2"
     ports:
       - "${GITLAB_HTTP_PORT:-8080}:80"
-      - "${GITLAB_REGISTRY_PORT:-5050}:5050"
+      # Both sides move together: GITLAB_REGISTRY_PORT also sets
+      # registry_nginx['listen_port'] above, so publishing it to a fixed 5050
+      # inside would point the host at a port nothing listens on.
+      - "${GITLAB_REGISTRY_PORT:-5050}:${GITLAB_REGISTRY_PORT:-5050}"
       - "${GITLAB_SSH_EXTERNAL_PORT:-2222}:22"
     volumes:
       - ./data/gitlab/config:/etc/gitlab

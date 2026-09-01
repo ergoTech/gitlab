@@ -85,6 +85,15 @@ docker exec gitlab-runner gitlab-runner register \
     --docker-network-mode "gitlab-network"
 ```
 
+Behind a TLS-terminating proxy (`GITLAB_EXTERNAL_SCHEME=https`) drop
+`--docker-network-mode` and register with these instead, or every job dies at
+checkout on the proxy's http -> https redirect:
+
+```bash
+    --env "FF_NETWORK_PER_BUILD=true" \
+    --clone-url "https://your.gitlab.host"
+```
+
 **3. Update .gitlab-ci.yml:**
 ```yaml
 build:

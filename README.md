@@ -103,7 +103,9 @@ Paste the token when prompted.
 - **Executor**: Docker with socket mounting
 - **Default image**: `alpine:latest`
 - **Docker access**: Via host Docker socket (`/var/run/docker.sock`)
-- **Network**: `gitlab-network` (internal Docker network)
+- **Job network**: `gitlab-network` with `GITLAB_EXTERNAL_SCHEME=http`; one
+  network per job plus an explicit clone URL with `https` (the script prints
+  which one it picked)
 - **Privileged mode**: Enabled (required for Docker operations)
 
 **Note:** All runner settings (tags, description, etc.) are configured in GitLab UI before registration. This is the new workflow in GitLab 16.0+.
@@ -451,12 +453,11 @@ alone is not enough:
 GITLAB_EXTERNAL_SCHEME=https      # or GitLab hands out http:// URLs
 GITLAB_CONTAINER_HOSTNAME=gitlab  # or the public name resolves into the
                                   # container, on 443, where nothing listens
-# The scheme knob does NOT reach the registry, so set this too. It has to name
-# something your proxy actually serves, and the registry vhost below cannot bind
-# 5050 as written - compose already publishes GITLAB_REGISTRY_PORT there. Move
-# the container's port (GITLAB_REGISTRY_PORT=5051) or give the registry its own
-# subdomain, certificate and port, then set this to match.
-GITLAB_REGISTRY_EXTERNAL_URL=https://gitlab.example.com:5050
+# The scheme knob does NOT reach the registry, so set this too, and give the
+# registry its own name: the vhost below serves it on 443, which the main name
+# is already using. Keeping it off a port also keeps it working behind a CDN
+# that only proxies the standard ones.
+GITLAB_REGISTRY_EXTERNAL_URL=https://registry.example.com
 ```
 
 Then the vhost:
@@ -475,10 +476,11 @@ server {
     }
 }
 
-# Container Registry
+# Container Registry - its own name, so it can have 443 to itself.
+# The upstream port is GITLAB_REGISTRY_PORT; change one and change the other.
 server {
-    listen 5050 ssl;
-    server_name gitlab.example.com;
+    listen 443 ssl;
+    server_name registry.example.com;
     
     location / {
         proxy_pass http://localhost:5050;
