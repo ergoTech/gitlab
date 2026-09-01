@@ -15,13 +15,38 @@ services:
   gitlab:
     image: gitlab/gitlab-ce:18.6.1-ce.0
     container_name: gitlab
-    hostname: ${GITLAB_HOSTNAME:-gitlab.local}
+    # Docker registers this name in the embedded DNS for the WHOLE network, not
+    # just in this container's /etc/hosts - every container on gitlab-network
+    # resolves it to this one. Defaults to GITLAB_HOSTNAME, which is what makes
+    # a plain-http local setup work: register-runner.sh puts CI job containers
+    # on gitlab-network and they clone from external_url, so gitlab.local has to
+    # resolve to this container on port 80, and it does. (A runner configured
+    # with network_per_build and an explicit clone_url - as the production one
+    # is - does not depend on this either way.)
+    #
+    # Override it with an internal name when GITLAB_EXTERNAL_SCHEME is https:
+    # the clone URL is then https://<public name>, that name still resolves to
+    # this container inside the network, and nothing here listens on 443
+    # (nginx['listen_port'] = 80 below). See GITLAB_CONTAINER_HOSTNAME.
+    hostname: ${GITLAB_CONTAINER_HOSTNAME:-${GITLAB_HOSTNAME:-gitlab.local}}
     restart: unless-stopped
     environment:
       TZ: ${TZ:-UTC}
       GITLAB_OMNIBUS_CONFIG: |
-        # External URL (no https - nginx proxy handles TLS)
-        external_url 'http://${GITLAB_HOSTNAME:-gitlab.local}'
+        # Scheme is a knob because TLS is terminated by a proxy in front, not
+        # here. Two directives below keep GitLab's own nginx out of the way and
+        # they are not interchangeable: listen_port picks the port (80, so not
+        # 443), and listen_https = false decides whether that port speaks TLS.
+        # Drop the second with the scheme at https and `@https` flips for the
+        # whole server block: omnibus stops seeing listen_https as false, decides
+        # Let's Encrypt should be on, and tries to issue a certificate for the
+        # public name on a host that never asked for one. Without a certificate
+        # nginx will not start at all; with one it renders `listen *:80 ssl;` and
+        # the proxy then talks plain HTTP at a TLS port, so every request is a
+        # 400. Setting this to https changes real behaviour,
+        # not just generated links - read GITLAB_EXTERNAL_SCHEME in .env.sample
+        # before you touch it.
+        external_url '${GITLAB_EXTERNAL_SCHEME:-http}://${GITLAB_HOSTNAME:-gitlab.local}'
 
         # SSH settings
         gitlab_rails['gitlab_shell_ssh_port'] = ${GITLAB_SSH_PORT:-22}

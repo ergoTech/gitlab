@@ -35,6 +35,13 @@ nano .env
 
 **Important settings in `.env`:**
 - `GITLAB_HOSTNAME` - Your GitLab hostname (e.g., `gitlab.local`)
+- `GITLAB_EXTERNAL_SCHEME` - `http` (default) or `https` when a proxy in front
+  terminates TLS. Changes behaviour, not just links: with `https`, the session
+  cookie becomes `Secure` and plain-http login stops working. See `.env.sample`.
+- `GITLAB_CONTAINER_HOSTNAME` - the container's hostname, which Docker also
+  publishes to the whole network. Leave it unset on http (it defaults to
+  `GITLAB_HOSTNAME`, which is what local CI clones rely on); set it to `gitlab`
+  when `GITLAB_EXTERNAL_SCHEME=https`. See `.env.sample`.
 - `GITLAB_ROOT_PASSWORD` - Initial root password (min 8 chars)
 - `GITLAB_SSH_PORT` - SSH port for git operations (default: 2222)
 - `GITLAB_HTTP_PORT` - HTTP port for web UI (default: 8080)
@@ -437,7 +444,22 @@ gitlab.local:5050/group/project/image:tag
 
 ### External Nginx Proxy
 
-If using external nginx for TLS:
+If using external nginx for TLS, set both of these in `.env` first - the proxy
+alone is not enough:
+
+```bash
+GITLAB_EXTERNAL_SCHEME=https      # or GitLab hands out http:// URLs
+GITLAB_CONTAINER_HOSTNAME=gitlab  # or the public name resolves into the
+                                  # container, on 443, where nothing listens
+# The scheme knob does NOT reach the registry, so set this too. It has to name
+# something your proxy actually serves, and the registry vhost below cannot bind
+# 5050 as written - compose already publishes GITLAB_REGISTRY_PORT there. Move
+# the container's port (GITLAB_REGISTRY_PORT=5051) or give the registry its own
+# subdomain, certificate and port, then set this to match.
+GITLAB_REGISTRY_EXTERNAL_URL=https://gitlab.example.com:5050
+```
+
+Then the vhost:
 
 ```nginx
 server {
