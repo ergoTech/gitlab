@@ -296,8 +296,9 @@ is kept anyway. The script therefore never touches named volumes (prod databases
 where they exist, and the runner caches, live in them), removes containers in one
 case only — a CI build container named `runner-*` that exited over
 `BUILD_CONTAINER_RETENTION_HOURS` ago, together with its own anonymous volumes,
-while exited one-shots like `prod-migrate` are kept for their logs — and only
-ever prunes images behind an age filter, including when it escalates.
+and only on a pass that finds no CI job running, while exited one-shots like
+`prod-migrate` are kept for their logs — and only ever prunes images and build
+cache behind an age filter, including when it escalates.
 
 When the disk fills, the registry starts answering `500 Internal Server Error` to
 `POST /v2/<image>/blobs/uploads/`. Pipelines then fail at the push step **with a
@@ -320,7 +321,7 @@ That writes `/etc/cron.d/gitlab-maintenance`:
 
 | When | What |
 |------|------|
-| Mon–Sat 03:30 | abandoned CI build containers, buildkit cache, unreferenced images created over 7 days ago, archived journals |
+| Mon–Sat 03:30 | abandoned CI build containers (only with no CI job running), build cache unused for a day, unused images first tagged or pulled over a day ago, archived journals |
 | Sun 03:30 | the above plus registry garbage collection |
 
 Registry GC **stops** the registry for the duration, which is why it is weekly and
@@ -329,16 +330,32 @@ cannot corrupt the storage. An interrupted GC (reboot, OOM) leaves the registry
 stopped — the same 500-on-push symptom as a full disk — so the script checks
 afterwards and starts it back up, shouting in the log if it cannot.
 
-Above 85% usage a run escalates to a 1-hour age filter instead of 7 days. It stays
-a filter rather than dropping to nothing: an image a pipeline built seconds ago has
-no container referencing it until it is pushed, and sweeping it mid-pipeline would
-cause exactly the failure this script exists to prevent. For the same reason no
-pruning happens at all while a CI job is running.
+Above 85% usage a run escalates to a 1-hour age filter instead of 24 hours, for
+build cache and images alike. It stays a filter rather than dropping to nothing: an
+image a pipeline built seconds ago has no container referencing it until it is
+pushed, and sweeping it mid-pipeline would cause exactly the failure this script
+exists to prevent.
 
-Note on the age filter: Docker's `until` matches image **creation** time, not last
-use. A base image pulled today can be months old by it. The window is not "keep
-what we still need" — it is only a guarantee that a just-built image survives long
-enough to be pushed.
+That filter, not a check for running jobs, is what protects a live pipeline, so
+build cache and images are pruned — and a run escalates — while a CI job is
+running too. Skipping them whenever a job was running is how this disk reached
+100% on 2026-09-11: a job was running at 03:30 on four of the ten nights up to
+it, and on the last, at 93%, the run declined to escalate. Only abandoned CI build
+containers still wait for a pass with no job running.
+
+The filter does not cover everything, and each gap can fail the one job it hits
+(retry it): a **reused** tag — `docker build -t X:latest` over an existing
+`X:latest` keeps the tag's first creation time, so a prune between that build and
+`docker push X:latest` can remove it; a build with `SOURCE_DATE_EPOCH` set, whose
+tag is dated by that epoch rather than by the build; and a pull that is in flight
+when the prune starts. The comment at `prune_images_and_build_cache` in the script
+has the details.
+
+Note on the age filter: it is not the CREATED column of `docker images`. On this
+host's containerd image store an image's age is the time its **name** was created
+here — by the build that first tagged it or the pull that first fetched it — and
+build cache ages from its last **use**. The window is not "keep what we still
+need" — it only keeps a just-built tag alive long enough to be pushed.
 
 Run it by hand at any time:
 
@@ -354,7 +371,7 @@ redirect stdout to `/dev/null`, so a scheduled run is silent unless it fails —
 failures go to stderr and the exit code is non-zero, which is what makes cron
 mail (`MAILTO`, default `root`) mean something actually broke.
 
-Tune via environment variables: `IMAGE_RETENTION` (default `168h`),
+Tune via environment variables: `IMAGE_RETENTION` (default `24h`),
 `ESCALATION_RETENTION` (`1h`), `BUILD_CONTAINER_RETENTION_HOURS` (`8`, a bare
 number of hours — not a docker duration string), `DISK_ESCALATE_PCT` (`85`),
 `MAINTENANCE_LOG`, `MAINTENANCE_LOCK`, `GITLAB_CONTAINER`. Set the cron recipient with

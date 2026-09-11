@@ -24,12 +24,16 @@
 #     removed CI build container go with it — `docker rm -v` cannot reach a
 #     named volume, so this is bounded to the container's own scratch;
 #   - containers are removed in ONE case only: a CI build container (name
-#     `runner-*`) that exited longer ago than BUILD_CONTAINER_RETENTION_HOURS.
+#     `runner-*`) that exited longer ago than BUILD_CONTAINER_RETENTION_HOURS,
+#     on a pass that finds no CI job running.
 #     Everything else is kept, including exited one-shots such as prod-migrate
 #     and stage-migrate on a host that has them — they hold their last run's
 #     logs, and removing them would unpin their images;
-#   - images are only ever pruned with an age filter, so an image built seconds
-#     ago by a running pipeline and not yet pushed cannot be swept from under it.
+#   - images and build cache are only ever pruned behind an age window, and that
+#     window, not a check for running CI jobs, is what keeps a tag a pipeline has
+#     just built from being swept before it is pushed. What it does not cover —
+#     a reused tag such as :latest, among others — is spelled out at
+#     prune_images_and_build_cache.
 #
 # Run daily via cron for 2, weekly for 1 (registry GC stops the registry for the
 # duration, so it is not something to do every night). See `make install-cron`.
@@ -55,12 +59,39 @@ LOCK_FILE="${MAINTENANCE_LOCK:-/var/lock/gitlab-maintenance.lock}"
 LOG_FILE="${MAINTENANCE_LOG:-/var/log/gitlab-maintenance.log}"
 LOG_MAX_BYTES=$((10 * 1024 * 1024))
 
-# Images CREATED longer ago than this may be pruned when nothing references
-# them. Note this is creation time, not last-used time — that is what Docker's
-# `until` filter means, and a base image pulled today can be years old by it.
+# Build cache and images older than this may be pruned when nothing uses them.
+# "Older" is measured two ways, and neither is the CREATED column of
+# `docker images`:
+#   - build cache: time since it was last USED (buildkit's keep-duration, which
+#     buildx also still accepts under its old name, `unused-for`);
+#   - images: time since the image's NAME was created on this host, by the build
+#     that first tagged it or the pull that first fetched it. That is the
+#     containerd image store, which this host runs (`docker info` reports
+#     driver-type io.containerd.snapshotter.v1). The classic graphdriver store
+#     compared the image's own created field instead — the CREATED column, by
+#     which a base image pulled today can be years old.
+# Checked on 2026-09-11 against Docker 29.7.2 with the containerd store, the
+# version this host runs. One build tagged the same image twice: a new tag, and
+# one an earlier build had created just over a minute before. Under until=1m
+# the new tag survived and the older one was pruned. Build cache created just
+# over a minute before, but reused seconds before, survived.
+#
 # The point of the window is narrower than "keep what we still need": it is to
-# guarantee an image a pipeline just built is never removed before it is pushed.
-IMAGE_RETENTION="${IMAGE_RETENTION:-168h}"
+# keep a tag a pipeline just built from being removed before it is pushed. It
+# does that for a new tag from an ordinary build; the cases it does not cover
+# are listed at prune_images_and_build_cache.
+#
+# 24h, down from the 168h this started with. Like BUILD_CONTAINER_RETENTION_HOURS
+# below, this is sampled by a 03:30 cron, so an unused image lives up to N+24
+# hours: two days at 24h, eight at 168h. And on a host that starts empty, 168h
+# is a week in which nothing is old enough to go: the nightly runs from
+# 2026-09-02 to 09-07 freed 2 GB at most while the disk went from 57% to 71%;
+# the first prune after that week, on 09-09, freed 13 GB. The price of the
+# shorter window: build cache idle for a day goes, so the first build after a
+# quiet weekend runs cold, and a CI image nothing is running at 03:30 — a
+# service image such as mongo:8 — goes once its name is a day old and is
+# downloaded again by the next job that needs it.
+IMAGE_RETENTION="${IMAGE_RETENTION:-24h}"
 
 # Escalation keeps a window too, for exactly the same reason. One hour is far
 # longer than any build-to-push gap here and still sweeps everything old.
@@ -115,10 +146,11 @@ disk_line() {
     df -h / | tail -1
 }
 
-# A CI job holds images that exist only on this host until `docker push`
-# succeeds. Pruning during one can delete a freshly built image between build
-# and push, which fails the pipeline at exactly the step this script exists to
-# keep working.
+# True while any CI build container is up. It holds back removing CI build
+# containers, decides whether a leftover buildx builder is worth reporting, and
+# marks in the log an escalation that ran during a job. It does NOT hold back the
+# image and build-cache prunes any more; prune_images_and_build_cache has what
+# protects a live job from those, and what does not.
 ci_job_running() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^runner-'
 }
@@ -217,6 +249,63 @@ remove_abandoned_build_containers() {
     fi
 }
 
+# Build cache, then images, both behind the same window. This runs whether or
+# not a CI job is live, and that is a decision, not an oversight.
+#
+# It used to be skipped for the whole pass whenever any runner-* container was
+# up. The log has that skip on four of the ten nights up to 2026-09-11 — 09-04,
+# 09-08, 09-10 and 09-11 — and on the 11th, at 93%, the run would not escalate
+# either. The disk reached 100% that day, and GitLab refused every push to
+# every project until the images and build cache were pruned by hand.
+#
+# What keeps a live pipeline safe without that check:
+#   - docker never prunes the tag a container was created from, running or
+#     stopped — only that tag: other tags of the same image can go, and a build
+#     that later moves the tag takes the protection with it — nor build cache
+#     that a running build holds;
+#   - a tag a build has just created stays younger than either window for far
+#     longer than any push here takes (IMAGE_RETENTION has how age is counted).
+#
+# Three cases fall through, and they are the price of the choice. Each can fail
+# the job it hits, and a retry fixes it, since the prune runs once a night:
+#   - a REUSED tag. `docker build -t X:latest` over an existing X:latest updates
+#     the tag in place and keeps its first creation time, so until the job has
+#     pushed it, or used it by name in any other way, the tag can be older than
+#     the window with nothing using it. build/base's build-latest is exactly
+#     that: it builds :latest and :sha together and pushes :latest last, so a
+#     prune in that gap fails it at a push, with the registry's :latest still
+#     on the previous image. On a re-run of the same commit, :sha can be a
+#     reused tag too;
+#   - a build with SOURCE_DATE_EPOCH set, as a build-arg or just in the job's
+#     environment, which buildx passes on. The new tag is then dated by that
+#     epoch, not by the build, so once the epoch is older than the window the
+#     tag is unprotected from the start;
+#   - a pull in flight. `docker image prune` begins by deleting the leases that
+#     in-flight pulls hold, so what a pull has fetched but not yet named can go
+#     whatever its age; and a re-pull keeps the name's first creation time, so
+#     an idle image past the window can lose its name between the pull and the
+#     container that was about to use it.
+# The old check covered all three for a job that already had a container up
+# when the run began — not one that started during the run, nor a job still
+# pulling before its first container.
+#
+# Waiting for an idle moment instead would make these rarer, not impossible: a
+# night busy enough to need the wait times out into exactly this. It would cost
+# a timeout to tune, a run that holds the lock for the whole wait, and a Sunday
+# registry GC pushed later into the morning — all to avoid a retried job, where
+# the skip it replaces cost a full disk.
+prune_images_and_build_cache() {
+    local window=$1 label=$2
+
+    log "Pruning build cache not used in the last ${window}..."
+    docker builder prune -af --filter "until=${window}" >/dev/null 2>&1 ||
+        fail "${label}builder prune failed"
+
+    log "Pruning unused images first tagged or pulled over ${window} ago..."
+    docker image prune -af --filter "until=${window}" >/dev/null 2>&1 ||
+        fail "${label}image prune failed"
+}
+
 registry_running() {
     docker exec "$GITLAB_CONTAINER" gitlab-ctl status registry 2>/dev/null | grep -q '^run:'
 }
@@ -253,21 +342,17 @@ main() {
     log "${YELLOW}=== Maintenance start (registry_gc=${WITH_REGISTRY_GC}) ===${NC}"
     log "Before: $(disk_line)"
 
+    # Containers keep the old rule and wait for a pass with no CI job running;
+    # the prunes after them do not wait — prune_images_and_build_cache says why.
     if ci_job_running; then
-        log "${YELLOW}A CI job is running — skipping image pruning this pass${NC}"
+        log "${YELLOW}A CI job is running — leaving abandoned CI build containers for an idle pass, pruning build cache and images anyway${NC}"
     else
         # Before the prunes, not after: removing these is what makes the images
         # they were holding eligible in this same run rather than the next one.
         remove_abandoned_build_containers
-
-        log "Pruning buildkit cache older than ${IMAGE_RETENTION}..."
-        docker builder prune -af --filter "until=${IMAGE_RETENTION}" >/dev/null 2>&1 ||
-            fail "builder prune failed"
-
-        log "Pruning unreferenced images created more than ${IMAGE_RETENTION} ago..."
-        docker image prune -af --filter "until=${IMAGE_RETENTION}" >/dev/null 2>&1 ||
-            fail "image prune failed"
     fi
+
+    prune_images_and_build_cache "$IMAGE_RETENTION" ""
 
     # The multiarch pipeline creates a docker-container buildx builder and drops
     # it in after_script; its cache lives in that builder, not in the daemon's,
@@ -294,18 +379,23 @@ main() {
     used=$(disk_used_pct) || used=0
     if [ -z "$used" ]; then used=0; fi
 
+    # Escalation prunes build cache as well as images: on 2026-09-11 the build
+    # cache was the larger half of what had to go by hand (11.82 GB, against
+    # 10.24 GB of images). And it escalates while a CI job runs too — the 11th
+    # was exactly that night: 93%, a job running, and the old rule here
+    # declined. The log line says whether a job was running, so a pipeline that
+    # failed at a push at this hour can be traced back here.
     if [ "$used" -ge "$DISK_ESCALATE_PCT" ]; then
+        local during=""
         if ci_job_running; then
-            fail "Disk at ${used}% but a CI job is running — NOT escalating, rerun after it finishes"
-        else
-            log "${RED}Disk at ${used}% (>= ${DISK_ESCALATE_PCT}%) — escalating to images older than ${ESCALATION_RETENTION}${NC}"
-            docker image prune -af --filter "until=${ESCALATION_RETENTION}" >/dev/null 2>&1 ||
-                fail "escalated image prune failed"
-            used=$(disk_used_pct) || used=0
-            [ -n "$used" ] || used=0
-            if [ "$used" -ge "$DISK_ESCALATE_PCT" ]; then
-                fail "Disk STILL at ${used}% after escalation — needs a human"
-            fi
+            during=", with a CI job running"
+        fi
+        log "${RED}Disk at ${used}% (>= ${DISK_ESCALATE_PCT}%) — escalating to build cache and images older than ${ESCALATION_RETENTION}${during}${NC}"
+        prune_images_and_build_cache "$ESCALATION_RETENTION" "escalated "
+        used=$(disk_used_pct) || used=0
+        [ -n "$used" ] || used=0
+        if [ "$used" -ge "$DISK_ESCALATE_PCT" ]; then
+            fail "Disk STILL at ${used}% after escalation — needs a human"
         fi
     fi
 
