@@ -61,7 +61,9 @@
 # status learns about it. Cron mails for a different reason — it mails on
 # OUTPUT, and the failure line goes to stderr while the cron entries discard
 # stdout. The GitLab host has no MTA, though, so that mail goes nowhere; a run
-# with failures also sends them to Telegram (notify-telegram.sh).
+# with failures also sends them to Telegram (notify-telegram.sh) and opens an
+# alert in the backoffice (notify-backoffice.sh, key maintenance), which the
+# next run without failures resolves.
 
 set -euo pipefail
 
@@ -427,14 +429,47 @@ main() {
     fi
 
     log "After:  $(disk_line)"
+    local why rc=0
     if [ "$FAILED" -eq 0 ]; then
         log "${GREEN}=== Maintenance done ===${NC}"
+        # Closes the alert an earlier failed run opened in the backoffice; with
+        # none open the intake takes it and changes nothing. Not Telegram: a
+        # quiet night is not news. A miss is retried by the next clean night.
+        # Not gated on anything any more. The gate was for the offline
+        # registry GC, which ran on Sundays only and could leave the registry
+        # down, so a clean weekday said nothing about it; that step is gone
+        # with the metadata database. A step skipped tonight — container
+        # removal while a CI job runs, escalation below the line — can still
+        # let this resolve an alert that the next night fires again: a warning
+        # that flaps, nothing worse.
+        why=$("$SCRIPT_DIR/notify-backoffice.sh" maintenance resolved 2>&1 >/dev/null) || rc=$?
+        case "$rc" in
+            0|3) ;;
+            *) why=${why##*$'\n'}; log "${YELLOW}Could not resolve the maintenance alert in the backoffice: ${why#notify-backoffice: }${NC}" ;;
+        esac
     else
         log "${RED}=== Maintenance finished WITH FAILURES ===${NC}"
-        local text
+        local text details
         text="GitLab maintenance finished with failures:"
         text+=$(printf '\n- %s' "${FAIL_MESSAGES[@]}")
         text+=$'\n'"$(disk_line)"$'\n'"Log: $LOG_FILE"
+        details=${text#*$'\n'}
+        # The backoffice first, so that its failure can ride along in the
+        # Telegram message — the one place on this host where someone reads it.
+        # Not retried: the next run fires again or resolves, either way.
+        # Always a warning. Critical was for a registry the offline GC left
+        # down, which failed every push until someone acted; no failure here
+        # can do that now — a full disk can, and disk-alert.sh raises that as
+        # critical on its own.
+        why=$("$SCRIPT_DIR/notify-backoffice.sh" maintenance firing warning \
+            "GitLab maintenance finished with failures" "$details" 2>&1 >/dev/null) || rc=$?
+        case "$rc" in
+            0|3) ;;
+            *) why=${why##*$'\n'}
+               why=${why#notify-backoffice: }
+               log "${RED}Could not send the failure to the backoffice: ${why}${NC}"
+               text+=$'\n'"Backoffice not updated: ${why}" ;;
+        esac
         if ! "$SCRIPT_DIR/notify-telegram.sh" "$text" 2>&1; then
             log "${RED}Could not send the failure to Telegram either${NC}"
         fi

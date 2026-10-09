@@ -1,4 +1,4 @@
-.PHONY: help up down restart logs logs-gitlab logs-runner status ps clean backup restore get-password register-runner health maintenance install-cron disk-alert
+.PHONY: help up down restart logs logs-gitlab logs-runner status ps clean backup restore get-password register-runner health maintenance install-cron disk-alert test
 
 # Default target
 .DEFAULT_GOAL := help
@@ -120,8 +120,11 @@ prune: ## Remove unused Docker resources
 	@echo "$(GREEN)Prune complete!$(NC)"
 
 
-disk-alert: ## Run the disk alert check once: prints its decision, sends to Telegram if due
+disk-alert: ## Run the disk alert check once: prints its decision, sends to Telegram and the backoffice if due
 	sudo -E ./scripts/disk-alert.sh
+
+test: ## Run the tests for scripts/ in throwaway ubuntu:24.04 containers (needs Docker)
+	./tests/run.sh
 
 maintenance: ## Run the disk maintenance pass now (docker + journal)
 	@echo "$(YELLOW)Running maintenance...$(NC)"
@@ -145,5 +148,5 @@ install-cron: ## Install the scheduled maintenance (daily docker cleanup, disk a
 	@sudo chmod 644 /etc/cron.d/gitlab-maintenance
 	@echo "$(GREEN)Installed. Schedule:$(NC)"
 	@echo "  daily   03:30  docker cache + old images + journal"
-	@echo "  every 15 min   disk alert to Telegram at 85% / 95%"
+	@echo "  every 15 min   disk alert to Telegram and the backoffice at 85% / 95%"
 	@echo "  Log: /var/log/gitlab-maintenance.log"
