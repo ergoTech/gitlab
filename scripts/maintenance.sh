@@ -1,19 +1,24 @@
 #!/bin/bash
 # Disk maintenance for the GitLab host.
 #
-# Two things fill this disk, and neither cleans up after itself:
+# Two things have filled this disk. This script handles the second; the first
+# now cleans up after itself:
 #
 #   1. The container registry. Every pipeline pushes the same :latest tag, which
-#      leaves the previous manifest untagged. Untagged manifests and their blobs
-#      stay on disk forever unless garbage collection runs with -m. On this host
-#      that reached 41 GB before anyone noticed — the registry then answers 500
-#      to every blob upload, so every pipeline fails at the push step while the
-#      build itself is green, which reads like a broken build and is not one.
-#      Master builds also push a :<short-sha> tag, and a tagged image is never
-#      collected. GitLab's cleanup policies cannot untag a multi-arch one on
-#      this registry (registry-prune-tags.sh says why), and backend/core's are
-#      all multi-arch; the registry stood at 94 GB by 2026-10-08. So the GC
-#      pass untags old sha tags itself first.
+#      leaves the previous manifest untagged, and master builds also push a
+#      :<short-sha> tag. Without its metadata database the registry kept both
+#      forever: untagged manifests until an offline GC with -m, which stops the
+#      registry, and sha tags because GitLab's cleanup policies could not age a
+#      multi-arch image. That reached 41 GB, then 94 GB by 2026-10-08, and a full
+#      disk makes the registry answer 500 to every blob upload — every pipeline
+#      fails at the push step under a green build, which reads like a broken
+#      build and is not one.
+#      With the metadata database (docker-compose.yml, README "Registry metadata
+#      database") the cleanup policies untag old sha tags, and the registry
+#      collects what no tag references online, days later. Nothing here
+#      touches the registry any more, and nothing here could: offline GC refuses
+#      to run against a database-managed registry, and its storage no longer
+#      holds the metadata the registry reads.
 #
 #   2. The runner's Docker state. Multiarch builds leave buildkit cache and an
 #      unreferenced image per pipeline: 14.85 GB of cache and 56 GB of images
@@ -43,13 +48,14 @@
 #     a reused tag such as :latest, among others — is spelled out at
 #     prune_images_and_build_cache.
 #
-# Run daily via cron for 2, weekly for 1 (registry GC stops the registry for the
-# duration, so it is not something to do every night) — and for 1 on any night
-# the disk is past DISK_ESCALATE_PCT. See `make install-cron`.
+# Run daily via cron. See `make install-cron`.
 #
 # Usage:
-#   ./scripts/maintenance.sh                     # docker + journal only
-#   ./scripts/maintenance.sh --with-registry-gc  # everything
+#   ./scripts/maintenance.sh
+#
+# --with-registry-gc, which the weekly cron entry used to pass, is accepted and
+# ignored with a line in the log, so a cron file installed before the switch
+# keeps working instead of failing every Sunday on an unknown argument.
 #
 # Exit code is non-zero if any step failed, so monitoring that watches exit
 # status learns about it. Cron mails for a different reason — it mails on
@@ -57,7 +63,7 @@
 # stdout. The GitLab host has no MTA, though, so that mail goes nowhere; a run
 # with failures also sends them to Telegram (notify-telegram.sh) and opens an
 # alert in the backoffice (notify-backoffice.sh, key maintenance), which the
-# next run without failures resolves while the registry is up.
+# next run without failures resolves.
 
 set -euo pipefail
 
@@ -124,16 +130,13 @@ BUILD_CONTAINER_RETENTION_HOURS="${BUILD_CONTAINER_RETENTION_HOURS:-8}"
 # Above this usage the routine pass is not enough and the run escalates.
 DISK_ESCALATE_PCT="${DISK_ESCALATE_PCT:-85}"
 
-GITLAB_CONTAINER="${GITLAB_CONTAINER:-gitlab}"
-
-WITH_REGISTRY_GC=false
+LEGACY_GC_FLAG=false
 for arg in "$@"; do
     case "$arg" in
-        --with-registry-gc) WITH_REGISTRY_GC=true ;;
+        --with-registry-gc) LEGACY_GC_FLAG=true ;;
         # Everything from line 2 to the first non-comment line, computed rather
         # than hardcoded: the previous `sed -n '2,36p'` silently stopped covering
-        # --with-registry-gc the moment the header grew by three lines, so --help
-        # stopped documenting the flag the Sunday cron uses.
+        # a flag the moment the header grew by three lines.
         -h|--help) awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0"; exit 0 ;;
         *) echo "Unknown argument: $arg" >&2; exit 2 ;;
     esac
@@ -141,8 +144,6 @@ done
 
 FAILED=0
 FAIL_MESSAGES=()
-REGISTRY_GC_DONE=false
-REGISTRY_LEFT_DOWN=false
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
 log() {
@@ -200,8 +201,8 @@ remove_abandoned_build_containers() {
     # Validated rather than trusted, because this one is arithmetic: a value
     # like `24h` — the format both neighbouring knobs use — would abort the
     # whole run under `set -u`, taking the image prune, the journal vacuum and
-    # the registry restart-if-down safety net with it. A bad IMAGE_RETENTION
-    # only ever fails its own docker call.
+    # the escalation with it. A bad IMAGE_RETENTION only ever fails its own
+    # docker call.
     # Three shapes are rejected, and the second two are not pedantry:
     #   - non-numeric, the `24h` typo the neighbouring knobs invite;
     #   - seven digits or more, which is 114 years and up. That is a nonsense
@@ -308,9 +309,8 @@ remove_abandoned_build_containers() {
 #
 # Waiting for an idle moment instead would make these rarer, not impossible: a
 # night busy enough to need the wait times out into exactly this. It would cost
-# a timeout to tune, a run that holds the lock for the whole wait, and a Sunday
-# registry GC pushed later into the morning — all to avoid a retried job, where
-# the skip it replaces cost a full disk.
+# a timeout to tune and a run that holds the lock for the whole wait — all to
+# avoid a retried job, where the skip it replaces cost a full disk.
 prune_images_and_build_cache() {
     local window=$1 label=$2
 
@@ -321,86 +321,6 @@ prune_images_and_build_cache() {
     log "Pruning unused images first tagged or pulled over ${window} ago..."
     docker image prune -af --filter "until=${window}" >/dev/null 2>&1 ||
         fail "${label}image prune failed"
-}
-
-registry_running() {
-    docker exec "$GITLAB_CONTAINER" gitlab-ctl status registry 2>/dev/null | grep -q '^run:'
-}
-
-# The collector logs one line per blob and manifest it marks or finds eligible:
-# over 12,000 lines of the 2026-10-04 run were still in this log five days
-# later, most of it, pushing real history out at the 10 MB trim. The stage
-# summaries ("mark stage complete blobs_marked=… blobs_to_delete=…", "blobs
-# deleted count=…") are kept.
-GC_NOISE='msg="(marking blob|marking manifest|blob eligible for deletion|manifest eligible for deletion)"'
-
-run_registry_gc() {
-    # Set before the check, so a pass that already failed here does not try
-    # again from the escalation and report the same failure twice.
-    REGISTRY_GC_DONE=true
-    if ! docker ps --format '{{.Names}}' | grep -qx "$GITLAB_CONTAINER"; then
-        fail "Container '$GITLAB_CONTAINER' is not running — skipped registry GC entirely"
-        return
-    fi
-
-    # Untag with the registry already stopped, so no push can rewrite a tag
-    # while it goes. registry-garbage-collect stops it too (a no-op by then) and
-    # starts it again when it finishes, whether or not it succeeded.
-    #
-    # Between this stop and that start, the registry is down on this script's
-    # account alone: a Ctrl-C, or the HUP of a dropped ssh session during
-    # `make maintenance`, would leave it down until some later run noticed. The
-    # trap starts it back up on the way out. It is armed before the stop: the
-    # stop is a docker exec that finishes inside the container even if this
-    # script dies mid-call, and starting a registry that is still up is a
-    # no-op. It is cleared BEFORE the GC call, not after: once GC runs,
-    # gitlab-ctl inside the container owns the restart (killing the docker exec
-    # client does not stop it), and starting the registry under a running sweep
-    # is exactly what stopping it prevents.
-    #
-    # PIPE is in the list for a reason that is easy to miss: main runs as
-    # `main 2>&1 | tee`, and the same Ctrl-C or HUP kills tee too. The next
-    # thing this shell writes — bash's own "Terminated" notice for the killed
-    # child comes first — then raises SIGPIPE, which by default kills it before
-    # the INT/TERM/HUP handler ever runs. Measured in bash 5.2: without PIPE
-    # here, a TERM to the process group left the registry stopped.
-    log "Stopping the registry — pushes fail until GC is done..."
-    trap 'docker exec "$GITLAB_CONTAINER" gitlab-ctl start registry >/dev/null 2>&1; exit 130' INT TERM HUP PIPE
-    if docker exec "$GITLAB_CONTAINER" gitlab-ctl stop registry >/dev/null 2>&1; then
-        log "Untagging old sha tags..."
-        "$SCRIPT_DIR/registry-prune-tags.sh" 2>&1 ||
-            fail "Registry tag pruning failed — GC runs anyway, on whatever was untagged"
-    else
-        fail "Could not stop the registry — skipping tag pruning, running GC alone"
-    fi
-
-    # This line before `trap -`, not after: with tee already gone, it is the
-    # write that raises SIGPIPE, and it must do so while the trap still holds.
-    log "Running registry garbage collection..."
-    trap - INT TERM HUP PIPE
-    local gc_rc=0
-    docker exec "$GITLAB_CONTAINER" gitlab-ctl registry-garbage-collect -m 2>&1 |
-        { grep -vE "$GC_NOISE" || :; } || gc_rc=$?
-    if [ "$gc_rc" -eq 0 ]; then
-        log "${GREEN}Registry GC done${NC}"
-    else
-        fail "Registry GC FAILED — see $LOG_FILE"
-    fi
-
-    # gitlab-ctl stops the registry before collecting and starts it afterwards.
-    # An interrupted run (reboot, OOM, daemon restart) leaves it stopped, and a
-    # stopped registry fails every push with the same symptom as a full disk.
-    # Never end this function without knowing which state it is in.
-    if registry_running; then
-        return
-    fi
-    fail "Registry is DOWN after GC — starting it"
-    if docker exec "$GITLAB_CONTAINER" gitlab-ctl start registry 2>&1 && registry_running; then
-        log "${GREEN}Registry restarted${NC}"
-    else
-        REGISTRY_LEFT_DOWN=true
-        fail "Could not restart the registry — PUSHES ARE FAILING, fix by hand: docker exec $GITLAB_CONTAINER gitlab-ctl start registry"
-    fi
 }
 
 # The runner's cache volumes, `runner-<runner hash>-cache-<path hash>` with an
@@ -433,8 +353,11 @@ remove_unused_runner_cache_volumes() {
 }
 
 main() {
-    log "${YELLOW}=== Maintenance start (registry_gc=${WITH_REGISTRY_GC}) ===${NC}"
+    log "${YELLOW}=== Maintenance start ===${NC}"
     log "Before: $(disk_line)"
+    if [ "$LEGACY_GC_FLAG" = true ]; then
+        log "${YELLOW}--with-registry-gc ignored: the registry collects garbage online now. Run \`make install-cron\` to drop the flag from cron.${NC}"
+    fi
 
     # Containers keep the old rule and wait for a pass with no CI job running;
     # the prunes after them do not wait — prune_images_and_build_cache says why.
@@ -465,10 +388,6 @@ main() {
     log "Vacuuming systemd journal..."
     journalctl --vacuum-size=500M >/dev/null 2>&1 || fail "journal vacuum failed"
 
-    if [ "$WITH_REGISTRY_GC" = true ]; then
-        run_registry_gc
-    fi
-
     local used
     used=$(disk_used_pct) || used=0
     if [ -z "$used" ]; then used=0; fi
@@ -480,13 +399,13 @@ main() {
     # declined. The log line says whether a job was running, so a pipeline that
     # failed at a push at this hour can be traced back here.
     #
-    # Then, one step at a time and only while still over the line: registry GC
-    # with tag pruning on a night that is not Sunday, and finally the runner's
-    # unused cache volumes. The registry was the step this lacked on
-    # 2026-10-06..08: three nights of "needs a human" at 86-87%, with 94 GB in
-    # the registry that no step here could reach, until a push failed on a
-    # full disk. GC stops the registry for its duration, so a push at that
-    # moment fails and needs a retry — the same trade as the image prune.
+    # Then, only while still over the line, the runner's unused cache volumes.
+    #
+    # The registry is not a step here. Its space comes back when tags are
+    # deleted — by the cleanup policies, or by hand through the API — and
+    # online GC frees the blobs days after that; nothing a night run
+    # can do brings that forward. When this ends in "needs a human" and the
+    # registry is the bulk of the disk, that is where the human starts.
     if [ "$used" -ge "$DISK_ESCALATE_PCT" ]; then
         local during=""
         if ci_job_running; then
@@ -496,13 +415,6 @@ main() {
         prune_images_and_build_cache "$ESCALATION_RETENTION" "escalated "
         used=$(disk_used_pct) || used=0
         [ -n "$used" ] || used=0
-
-        if [ "$used" -ge "$DISK_ESCALATE_PCT" ] && [ "$REGISTRY_GC_DONE" = false ]; then
-            log "${RED}Disk still at ${used}% — escalating to registry tag pruning and GC${NC}"
-            run_registry_gc
-            used=$(disk_used_pct) || used=0
-            [ -n "$used" ] || used=0
-        fi
 
         if [ "$used" -ge "$DISK_ESCALATE_PCT" ]; then
             log "${RED}Disk still at ${used}% — escalating to unused runner cache volumes${NC}"
@@ -523,34 +435,33 @@ main() {
         # Closes the alert an earlier failed run opened in the backoffice; with
         # none open the intake takes it and changes nothing. Not Telegram: a
         # quiet night is not news. A miss is retried by the next clean night.
-        # Only with the registry up: a weekday run never touches it, so being
-        # clean says nothing about Sunday's "registry left down" — the one
-        # failure here that fails every push until someone acts.
-        if registry_running; then
-            why=$("$SCRIPT_DIR/notify-backoffice.sh" maintenance resolved 2>&1 >/dev/null) || rc=$?
-            case "$rc" in
-                0|3) ;;
-                *) why=${why##*$'\n'}; log "${YELLOW}Could not resolve the maintenance alert in the backoffice: ${why#notify-backoffice: }${NC}" ;;
-            esac
-        else
-            log "${YELLOW}The registry is not running — the maintenance alert in the backoffice stays open${NC}"
-        fi
+        # Not gated on anything any more. The gate was for the offline
+        # registry GC, which ran on Sundays only and could leave the registry
+        # down, so a clean weekday said nothing about it; that step is gone
+        # with the metadata database. A step skipped tonight — container
+        # removal while a CI job runs, escalation below the line — can still
+        # let this resolve an alert that the next night fires again: a warning
+        # that flaps, nothing worse.
+        why=$("$SCRIPT_DIR/notify-backoffice.sh" maintenance resolved 2>&1 >/dev/null) || rc=$?
+        case "$rc" in
+            0|3) ;;
+            *) why=${why##*$'\n'}; log "${YELLOW}Could not resolve the maintenance alert in the backoffice: ${why#notify-backoffice: }${NC}" ;;
+        esac
     else
         log "${RED}=== Maintenance finished WITH FAILURES ===${NC}"
-        local text details severity=warning
+        local text details
         text="GitLab maintenance finished with failures:"
         text+=$(printf '\n- %s' "${FAIL_MESSAGES[@]}")
         text+=$'\n'"$(disk_line)"$'\n'"Log: $LOG_FILE"
         details=${text#*$'\n'}
-        # Critical only for a registry left down, which fails every push until
-        # someone starts it; the rest can wait for a person to read it.
-        if [ "$REGISTRY_LEFT_DOWN" = true ]; then
-            severity=critical
-        fi
         # The backoffice first, so that its failure can ride along in the
         # Telegram message — the one place on this host where someone reads it.
         # Not retried: the next run fires again or resolves, either way.
-        why=$("$SCRIPT_DIR/notify-backoffice.sh" maintenance firing "$severity" \
+        # Always a warning. Critical was for a registry the offline GC left
+        # down, which failed every push until someone acted; no failure here
+        # can do that now — a full disk can, and disk-alert.sh raises that as
+        # critical on its own.
+        why=$("$SCRIPT_DIR/notify-backoffice.sh" maintenance firing warning \
             "GitLab maintenance finished with failures" "$details" 2>&1 >/dev/null) || rc=$?
         case "$rc" in
             0|3) ;;
@@ -566,7 +477,7 @@ main() {
     return "$FAILED"
 }
 
-# flock, not a PID file: the weekly and daily entries can collide, and two
+# flock, not a PID file: a hand-run and the nightly entry can collide, and two
 # concurrent image prunes on a daemon shared with production is a good way to
 # make a pipeline fail on a half-removed layer. fd 9 is released when this
 # process exits, including on SIGKILL; the lock file is deliberately not

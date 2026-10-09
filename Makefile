@@ -1,4 +1,4 @@
-.PHONY: help up down restart logs logs-gitlab logs-runner status ps clean backup restore get-password register-runner health registry-gc registry-tags maintenance install-cron disk-alert test
+.PHONY: help up down restart logs logs-gitlab logs-runner status ps clean backup restore get-password register-runner health maintenance install-cron disk-alert test
 
 # Default target
 .DEFAULT_GOAL := help
@@ -120,23 +120,18 @@ prune: ## Remove unused Docker resources
 	@echo "$(GREEN)Prune complete!$(NC)"
 
 
-registry-gc: maintenance ## Alias for maintenance (registry GC runs through the same lock)
-
-registry-tags: ## List the sha tags the next registry GC would untag (dry run, changes nothing)
-	sudo -E ./scripts/registry-prune-tags.sh --dry-run
-
 disk-alert: ## Run the disk alert check once: prints its decision, sends to Telegram and the backoffice if due
 	sudo -E ./scripts/disk-alert.sh
 
 test: ## Run the tests for scripts/ in throwaway ubuntu:24.04 containers (needs Docker)
 	./tests/run.sh
 
-maintenance: ## Run the full disk maintenance pass now (docker + journal + registry GC)
+maintenance: ## Run the disk maintenance pass now (docker + journal)
 	@echo "$(YELLOW)Running maintenance...$(NC)"
-	sudo -E ./scripts/maintenance.sh --with-registry-gc
+	sudo -E ./scripts/maintenance.sh
 	@echo "$(GREEN)Maintenance complete!$(NC)"
 
-install-cron: ## Install the scheduled maintenance (daily docker cleanup, weekly registry GC, disk alert)
+install-cron: ## Install the scheduled maintenance (daily docker cleanup, disk alert)
 	@echo "$(YELLOW)Installing /etc/cron.d/gitlab-maintenance...$(NC)"
 	@printf '%s\n' \
 		'# Disk maintenance for the GitLab host - installed by `make install-cron`.' \
@@ -147,13 +142,11 @@ install-cron: ## Install the scheduled maintenance (daily docker cleanup, weekly
 		'# Only stderr (failures) reaches mail.' \
 		'MAILTO=$(MAINTENANCE_MAILTO)' \
 		'' \
-		'30 3 * * 1-6 root $(CURDIR)/scripts/maintenance.sh >/dev/null' \
-		'30 3 * * 0 root $(CURDIR)/scripts/maintenance.sh --with-registry-gc >/dev/null' \
+		'30 3 * * * root $(CURDIR)/scripts/maintenance.sh >/dev/null' \
 		'*/15 * * * * root $(CURDIR)/scripts/disk-alert.sh >/dev/null' \
 		'' | sudo tee /etc/cron.d/gitlab-maintenance > /dev/null
 	@sudo chmod 644 /etc/cron.d/gitlab-maintenance
 	@echo "$(GREEN)Installed. Schedule:$(NC)"
-	@echo "  Mon-Sat 03:30  docker cache + old images + journal"
-	@echo "  Sun     03:30  the above plus old sha tags untagged and registry garbage collection"
+	@echo "  daily   03:30  docker cache + old images + journal"
 	@echo "  every 15 min   disk alert to Telegram and the backoffice at 85% / 95%"
 	@echo "  Log: /var/log/gitlab-maintenance.log"

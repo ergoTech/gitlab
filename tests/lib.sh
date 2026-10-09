@@ -25,11 +25,10 @@ finish() { echo "== $1: $pass passed, $failc failed"; [ "$failc" -eq 0 ]; }
 #   /tmp/calls    every docker call
 # TG_FAIL=1 fails the Telegram send. BO_RC is the backoffice's exit code (0 by
 # default; 3 channel off, 75 worth retrying, anything else refused).
-# For maintenance.sh: AFTER_ESC, AFTER_GC and AFTER_VOL set the usage the
-# escalated prune, the registry GC and the volume removal leave behind;
-# GC_RC fails the GC, STOP_FAIL=1 the registry stop, REG_DOWN=1 leaves the
-# registry down after GC with every start failing, and REG_DOWN=2 leaves it
-# down until the first start.
+# For maintenance.sh: AFTER_ESC and AFTER_VOL set the usage the escalated
+# prune and the volume removal leave behind. `docker exec` into the gitlab
+# container is recorded and answered with nothing: maintenance.sh no longer
+# touches the registry, and the tests check that it never does.
 stub_world() {
     W=/w
     rm -rf "$W"
@@ -66,10 +65,10 @@ exit 0
 EOF
     # The `ps --format` listing goes out through `env printf` in one write(),
     # as docker's own CLI writes it. bash's builtin printf writes it a line at
-    # a time, and maintenance.sh reads it with `| grep -qx gitlab` under
-    # pipefail: grep can match the first line and exit before the second is
-    # written, SIGPIPE kills the stub, and the run logs "Container 'gitlab' is
-    # not running" — under parallel load, now and then.
+    # a time, and a reader under pipefail that matches an early line and exits
+    # — `| grep -qx gitlab`, while maintenance.sh still ran the registry GC —
+    # leaves the stub to die of SIGPIPE before the next line, under parallel
+    # load, now and then.
     cat >"$W/bin/docker" <<'EOF'
 #!/bin/bash
 echo "docker $*" >>/tmp/calls
@@ -81,24 +80,7 @@ case "$1 $2" in
   "image prune") case "$*" in *until=1h*) setu "${AFTER_ESC:-}";; esac; exit 0;;
   "volume ls") printf '%s\n' runner-0123456789abcdef0123456789abcdef-cache-00000000000000000000000000000001 runner-0123456789abcdef0123456789abcdef-cache-00000000000000000000000000000002-protected abababababababababababababababababababababababababababababababab prod-mongodb-data; exit 0;;
   "volume rm") setu "${AFTER_VOL:-}"; exit 0;;
-  "exec gitlab")
-    case "$*" in
-      *"status registry"*)
-        if [ "${REG_DOWN:-}" = 1 ] || { [ "${REG_DOWN:-}" = 2 ] && [ ! -e /tmp/reg-started ]; }; then
-          echo "down: registry: 5s"
-        else
-          echo "run: registry: (pid 1) 5s"
-        fi
-        exit 0;;
-      *"start registry"*) [ "${REG_DOWN:-}" = 1 ] && exit 1; touch /tmp/reg-started; echo "ok: run: registry"; exit 0;;
-      *"stop registry"*) [ "${STOP_FAIL:-}" = 1 ] && exit 1; echo "ok: down: registry"; exit 0;;
-      *registry-garbage-collect*)
-        for i in $(seq 1 50); do echo "time=x level=info msg=\"marking blob\" digest=sha256:$i"; echo "time=x level=info msg=\"blob eligible for deletion\" digest=sha256:$i"; done
-        echo 'time=x level=info msg="mark stage complete" blobs_marked=8232 blobs_to_delete=135'
-        echo 'time=x level=info msg="blobs deleted" count=135'
-        echo "ok: run: registry: (pid 2) 0s"
-        setu "${AFTER_GC:-}"; exit "${GC_RC:-0}";;
-    esac;;
+  "exec gitlab") exit 0;;
 esac
 echo "unhandled: $*" >&2; exit 0
 EOF

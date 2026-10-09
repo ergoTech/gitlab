@@ -1,11 +1,12 @@
 #!/bin/bash
 # registry-prune-tags.sh on a synthetic registry storage tree: which tags it
-# untags, which it never touches, and how it fails.
+# untags, which it never touches, and how it fails — including that it refuses
+# to run once the registry keeps its metadata in the database.
 set -u
 . /t/lib.sh || exit 2
 S=/s
 
-R=$(mktemp -d)/v2/repositories
+R=$(mktemp -d)/docker/registry/v2/repositories
 mk() { # repo tag age_days
     local d="$R/$1/_manifests/tags/$2/current"
     mkdir -p "$d" "$R/$1/_manifests/tags/$2/index/sha256/abc"
@@ -48,14 +49,14 @@ check "[ -d $R/frontend/site/_manifests/tags/c0000001 ] && [ -d $R/frontend/site
 check "[ -d $R/backend/core/_layers/sha256/x/_manifests ]" "_layers untouched"
 
 # retention days protects young tags beyond keep_n
-R2=$(mktemp -d)/repositories
+R2=$(mktemp -d)/docker/registry/v2/repositories
 for i in $(seq 1 5); do d=$R2/p/_manifests/tags/$(printf 'd%07x' $i)/current; mkdir -p $d; echo x>$d/link; touch -d "@$(( $(date +%s) - i*3600 ))" $d/link; done
 REGISTRY_REPOS="$R2" REGISTRY_TAG_KEEP_N=1 bash $S/registry-prune-tags.sh >/dev/null; check "[ \$(ls $R2/p/_manifests/tags | wc -l) -eq 5 ]" "young tags kept beyond keep_n"
 REGISTRY_REPOS="$R2" REGISTRY_TAG_KEEP_N=0 REGISTRY_TAG_RETENTION_DAYS=1 bash $S/registry-prune-tags.sh >/dev/null; check "[ \$(ls $R2/p/_manifests/tags | wc -l) -eq 5 ]" "all younger than 1 day kept"
 
 # bad inputs
 REGISTRY_REPOS=/nonexistent bash $S/registry-prune-tags.sh >/dev/null 2>&1; check '[ $? -eq 1 ]' "missing path -> 1"
-E=$(mktemp -d); REGISTRY_REPOS=$E bash $S/registry-prune-tags.sh >/dev/null 2>&1; check '[ $? -eq 1 ]' "no repos -> 1"
+E=$(mktemp -d)/docker/registry/v2/repositories; mkdir -p $E; REGISTRY_REPOS=$E bash $S/registry-prune-tags.sh >/dev/null 2>&1; check '[ $? -eq 1 ]' "no repos -> 1"
 REGISTRY_REPOS="$R" REGISTRY_TAG_RETENTION_DAYS=14d bash $S/registry-prune-tags.sh >/dev/null 2>&1; check '[ $? -eq 2 ]' "14d rejected"
 REGISTRY_REPOS="$R" REGISTRY_TAG_RETENTION_DAYS=0 bash $S/registry-prune-tags.sh >/dev/null 2>&1; check '[ $? -eq 2 ]' "0 days rejected"
 REGISTRY_REPOS="$R" REGISTRY_TAG_KEEP_N=08 bash $S/registry-prune-tags.sh --dry-run >/dev/null 2>&1; check '[ $? -eq 0 ]' "leading zero ok"
@@ -63,8 +64,20 @@ bash $S/registry-prune-tags.sh --bogus >/dev/null 2>&1; check '[ $? -eq 2 ]' "un
 bash $S/registry-prune-tags.sh --help | grep -q "dry-run"; check '[ $? -eq 0 ]' "help prints usage"
 
 # removal failure is reported (read-only dir)
-R3=$(mktemp -d)/repositories; for i in $(seq 1 3); do d=$R3/p/_manifests/tags/$(printf 'e%07x' $i)/current; mkdir -p $d; echo x>$d/link; touch -d "@$(( $(date +%s) - (i+20)*86400 ))" $d/link; done
-chmod -R a+rX "$(dirname $R3)"; chmod 555 $R3/p/_manifests/tags
+T3=$(mktemp -d); R3=$T3/docker/registry/v2/repositories; for i in $(seq 1 3); do d=$R3/p/_manifests/tags/$(printf 'e%07x' $i)/current; mkdir -p $d; echo x>$d/link; touch -d "@$(( $(date +%s) - (i+20)*86400 ))" $d/link; done
+chmod -R a+rX "$T3"; chmod 555 $R3/p/_manifests/tags
 su nobody -s /bin/bash -c "REGISTRY_REPOS=$R3 REGISTRY_TAG_KEEP_N=1 bash $S/registry-prune-tags.sh" >/dev/null 2>&1; check '[ $? -eq 1 ]' "rm failure -> exit 1"
+
+# only the whole repositories tree, so the lockfile check looks in the right place
+REGISTRY_REPOS="$R/backend" bash $S/registry-prune-tags.sh --dry-run >/dev/null 2>&1; check '[ $? -eq 2 ]' "a subtree -> 2"
+REGISTRY_REPOS="$R/" bash $S/registry-prune-tags.sh --dry-run >/dev/null 2>&1; check '[ $? -eq 0 ]' "trailing slash accepted"
+
+# after the import: database-in-use next to v2/ -> refuses, removes nothing
+R4=$(mktemp -d)/docker/registry/v2/repositories
+for i in $(seq 1 3); do d=$R4/p/_manifests/tags/$(printf 'f%07x' $i)/current; mkdir -p $d; echo x>$d/link; touch -d "@$(( $(date +%s) - (i+20)*86400 ))" $d/link; done
+mkdir -p "$R4/../../lockfiles"; echo '{"version":1}' >"$R4/../../lockfiles/database-in-use"
+out=$(REGISTRY_REPOS="$R4" REGISTRY_TAG_KEEP_N=1 bash $S/registry-prune-tags.sh 2>&1); rc=$?
+check '[ $rc -eq 1 ] && [ $(ls $R4/p/_manifests/tags | wc -l) -eq 3 ] && echo "$out" | grep -q "uses its metadata database"' "database-in-use -> 1, nothing untagged"
+REGISTRY_REPOS="$R4/" bash $S/registry-prune-tags.sh --dry-run >/dev/null 2>&1; check '[ $? -eq 1 ]' "database-in-use, trailing slash, dry run -> still 1"
 
 finish registry-prune-tags
