@@ -55,7 +55,9 @@
 # status learns about it. Cron mails for a different reason — it mails on
 # OUTPUT, and the failure line goes to stderr while the cron entries discard
 # stdout. The GitLab host has no MTA, though, so that mail goes nowhere; a run
-# with failures also sends them to Telegram (notify-telegram.sh).
+# with failures also sends them to Telegram (notify-telegram.sh) and opens an
+# alert in the backoffice (notify-backoffice.sh, key maintenance), which the
+# next run without failures resolves while the registry is up.
 
 set -euo pipefail
 
@@ -140,6 +142,7 @@ done
 FAILED=0
 FAIL_MESSAGES=()
 REGISTRY_GC_DONE=false
+REGISTRY_LEFT_DOWN=false
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
 log() {
@@ -395,6 +398,7 @@ run_registry_gc() {
     if docker exec "$GITLAB_CONTAINER" gitlab-ctl start registry 2>&1 && registry_running; then
         log "${GREEN}Registry restarted${NC}"
     else
+        REGISTRY_LEFT_DOWN=true
         fail "Could not restart the registry — PUSHES ARE FAILING, fix by hand: docker exec $GITLAB_CONTAINER gitlab-ctl start registry"
     fi
 }
@@ -513,14 +517,48 @@ main() {
     fi
 
     log "After:  $(disk_line)"
+    local why rc=0
     if [ "$FAILED" -eq 0 ]; then
         log "${GREEN}=== Maintenance done ===${NC}"
+        # Closes the alert an earlier failed run opened in the backoffice; with
+        # none open the intake takes it and changes nothing. Not Telegram: a
+        # quiet night is not news. A miss is retried by the next clean night.
+        # Only with the registry up: a weekday run never touches it, so being
+        # clean says nothing about Sunday's "registry left down" — the one
+        # failure here that fails every push until someone acts.
+        if registry_running; then
+            why=$("$SCRIPT_DIR/notify-backoffice.sh" maintenance resolved 2>&1 >/dev/null) || rc=$?
+            case "$rc" in
+                0|3) ;;
+                *) why=${why##*$'\n'}; log "${YELLOW}Could not resolve the maintenance alert in the backoffice: ${why#notify-backoffice: }${NC}" ;;
+            esac
+        else
+            log "${YELLOW}The registry is not running — the maintenance alert in the backoffice stays open${NC}"
+        fi
     else
         log "${RED}=== Maintenance finished WITH FAILURES ===${NC}"
-        local text
+        local text details severity=warning
         text="GitLab maintenance finished with failures:"
         text+=$(printf '\n- %s' "${FAIL_MESSAGES[@]}")
         text+=$'\n'"$(disk_line)"$'\n'"Log: $LOG_FILE"
+        details=${text#*$'\n'}
+        # Critical only for a registry left down, which fails every push until
+        # someone starts it; the rest can wait for a person to read it.
+        if [ "$REGISTRY_LEFT_DOWN" = true ]; then
+            severity=critical
+        fi
+        # The backoffice first, so that its failure can ride along in the
+        # Telegram message — the one place on this host where someone reads it.
+        # Not retried: the next run fires again or resolves, either way.
+        why=$("$SCRIPT_DIR/notify-backoffice.sh" maintenance firing "$severity" \
+            "GitLab maintenance finished with failures" "$details" 2>&1 >/dev/null) || rc=$?
+        case "$rc" in
+            0|3) ;;
+            *) why=${why##*$'\n'}
+               why=${why#notify-backoffice: }
+               log "${RED}Could not send the failure to the backoffice: ${why}${NC}"
+               text+=$'\n'"Backoffice not updated: ${why}" ;;
+        esac
         if ! "$SCRIPT_DIR/notify-telegram.sh" "$text" 2>&1; then
             log "${RED}Could not send the failure to Telegram either${NC}"
         fi
