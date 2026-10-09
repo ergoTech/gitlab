@@ -1,4 +1,4 @@
-.PHONY: help up down restart logs logs-gitlab logs-runner status ps clean backup restore get-password register-runner health registry-gc registry-tags maintenance install-cron disk-alert
+.PHONY: help up down restart logs logs-gitlab logs-runner status ps clean backup restore get-password register-runner health registry-gc registry-tags maintenance install-cron disk-alert test
 
 # Default target
 .DEFAULT_GOAL := help
@@ -125,8 +125,11 @@ registry-gc: maintenance ## Alias for maintenance (registry GC runs through the 
 registry-tags: ## List the sha tags the next registry GC would untag (dry run, changes nothing)
 	sudo -E ./scripts/registry-prune-tags.sh --dry-run
 
-disk-alert: ## Run the disk alert check once: prints its decision, sends to Telegram if due
+disk-alert: ## Run the disk alert check once: prints its decision, sends to Telegram and the backoffice if due
 	sudo -E ./scripts/disk-alert.sh
+
+test: ## Run the tests for scripts/ in throwaway ubuntu:24.04 containers (needs Docker)
+	./tests/run.sh
 
 maintenance: ## Run the full disk maintenance pass now (docker + journal + registry GC)
 	@echo "$(YELLOW)Running maintenance...$(NC)"
@@ -152,5 +155,5 @@ install-cron: ## Install the scheduled maintenance (daily docker cleanup, weekly
 	@echo "$(GREEN)Installed. Schedule:$(NC)"
 	@echo "  Mon-Sat 03:30  docker cache + old images + journal"
 	@echo "  Sun     03:30  the above plus old sha tags untagged and registry garbage collection"
-	@echo "  every 15 min   disk alert to Telegram at 85% / 95%"
+	@echo "  every 15 min   disk alert to Telegram and the backoffice at 85% / 95%"
 	@echo "  Log: /var/log/gitlab-maintenance.log"

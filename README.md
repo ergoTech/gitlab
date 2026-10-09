@@ -349,7 +349,7 @@ That writes `/etc/cron.d/gitlab-maintenance`:
 |------|------|
 | Mon–Sat 03:30 | abandoned CI build containers (only with no CI job running), build cache unused for a day, unused images first tagged or pulled over a day ago, archived journals |
 | Sun 03:30 | the above plus old sha tags untagged and registry garbage collection |
-| every 15 min | disk alert to Telegram (see below) |
+| every 15 min | disk alert to Telegram and the backoffice (see below) |
 
 Registry GC **stops** the registry for the duration, which is why it is weekly and
 at night: a push landing in that window fails its pipeline (retry it), though it
@@ -407,7 +407,8 @@ redirect stdout to `/dev/null`, so a scheduled run is silent unless it fails —
 failures go to stderr and the exit code is non-zero, which is what makes cron
 mail (`MAILTO`, default `root`) mean something actually broke. **The GitLab host
 has no MTA, so that mail goes nowhere**; a run with failures also posts them to
-Telegram.
+Telegram and opens an alert in the backoffice, which the next clean run resolves
+while the registry is up (see [Disk alert](#disk-alert)).
 
 Tune via environment variables: `IMAGE_RETENTION` (default `24h`),
 `ESCALATION_RETENTION` (`1h`), `BUILD_CONTAINER_RETENTION_HOURS` (`8`, a bare
@@ -430,7 +431,26 @@ or 95% (critical), again every 6 hours while it stays at or above 85%, and once 
 when it falls back below 80%. Both times this disk filled, the first sign was a failed
 pipeline; this is meant to arrive days earlier.
 
-Credentials are two files under the gitignored `data/`, never in git:
+The same alert also goes to the backoffice, through the backend's ops-alert intake
+(`scripts/notify-backoffice.sh`), where it stays open until resolved: source
+`gitlab-host`, key `disk-root`, fired with severity `warning` or `critical` and
+resolved when the disk clears. A maintenance run with failures uses the same channel
+with key `maintenance`, and the next run without failures resolves it — but only
+with the registry up, since a weekday run never touches the registry and so cannot
+vouch for a Sunday "registry left down".
+
+Telegram is the channel that has to get through. The alert state only advances once
+Telegram has taken the message, and a failed send is retried on the next run, to both
+channels. The backoffice is tried first and never holds Telegram back; when it does
+not take an alert, the Telegram message gets a line saying so — with cron mail going
+nowhere, that line is where a wrong token shows up. A failure worth retrying (no
+answer, 408, 429, 5xx) is retried on the next run, to the backoffice alone, and so is
+an alert the backoffice took while Telegram failed; a refusal (a redirect, a wrong
+token, any other 4xx) is not, since sending the same again cannot help. One gap: when
+such a backoffice-only retry is refused, nothing reaches Telegram, and the backoffice
+can be left showing a stale alert — resolve it there by hand.
+
+Credentials are files under the gitignored `data/`, never in git. Telegram:
 
 ```bash
 sudo install -d -m 700 data/alerts
@@ -440,10 +460,34 @@ make disk-alert                                   # prints its decision, sends i
 sudo ./scripts/notify-telegram.sh "test message"  # proves delivery
 ```
 
-Without them both scripts still run; the message is not sent and the reason goes to
-stderr. Tune with `DISK_WARN_PCT` (85), `DISK_CRIT_PCT` (95), `DISK_ALERT_CLEAR_PCT`
-(80), `DISK_ALERT_REPEAT_HOURS` (6); state lives in
-`/var/lib/gitlab-disk-alert/state`.
+The backoffice: `backoffice_url` holds the full intake URL, ending in
+`/webhooks/ops-alerts`, and `backoffice_token` the backend's `OPS_ALERTS_TOKEN` (32
+characters or more), copied file to file like the bot token:
+
+```bash
+echo 'https://<backend>/webhooks/ops-alerts' | sudo tee data/alerts/backoffice_url >/dev/null
+# copy the backend's OPS_ALERTS_TOKEN into data/alerts/backoffice_token, file to file
+sudo chmod 600 data/alerts/backoffice_url data/alerts/backoffice_token
+sudo ./scripts/notify-backoffice.sh delivery-test firing info "Delivery test"; echo "exit $?"
+sudo ./scripts/notify-backoffice.sh delivery-test resolved; echo "exit $?"
+```
+
+Both print nothing when they work, so read the exit code: `0` taken (the first opens
+an alert in the backoffice, the second closes it), `3` the channel is off — no
+`backoffice_url` where the script looks — and anything else comes with its reason.
+
+Send that test from this host, not from a laptop: what has to work is the path from
+here through whatever sits in front of the backend. Without `backoffice_url` the
+channel is off and everything else works as before; without the Telegram files, the
+message is not sent and the reason goes to stderr. Tune with `DISK_WARN_PCT` (85),
+`DISK_CRIT_PCT` (95), `DISK_ALERT_CLEAR_PCT` (80), `DISK_ALERT_REPEAT_HOURS` (6),
+`BACKOFFICE_TIMEOUT` (15 seconds) and `OPS_ALERT_SOURCE` (`gitlab-host`); state lives
+in `/var/lib/gitlab-disk-alert/state`.
+
+`make test` (needs Docker) runs the tests of these scripts in throwaway `ubuntu:24.04`
+containers: docker, `df` and both senders are stubbed for the disk alert and the
+maintenance run, and `notify-backoffice.sh` sends its real curl requests to a local
+HTTPS stand-in for the intake.
 
 ## Troubleshooting
 
