@@ -283,7 +283,9 @@ Two things fill this host's disk and neither cleans up after itself:
 - **The container registry.** Every pipeline pushes the same `:latest` tag, which
   leaves the previous manifest untagged. Untagged manifests and their blobs are
   never removed unless garbage collection runs with `-m`. Left alone this reached
-  41 GB here.
+  41 GB here. Master builds also push a `:<short-sha>` tag, and a tagged image
+  is never collected at all: by 2026-10-08 the registry stood at 94 GB of a
+  145 GB disk.
 - **The runner's Docker state.** Multiarch builds leave buildkit cache and an
   unreferenced image per pipeline — 14.85 GB of cache and 56.56 GB of images
   (507 images, 26 of them in use).
@@ -298,7 +300,31 @@ case only — a CI build container named `runner-*` that exited over
 `BUILD_CONTAINER_RETENTION_HOURS` ago, together with its own anonymous volumes,
 and only on a pass that finds no CI job running, while exited one-shots like
 `prod-migrate` are kept for their logs — and only ever prunes images and build
-cache behind an age filter, including when it escalates.
+cache behind an age filter, including when it escalates. The one exception to
+the named-volume rule is the runner's own cache volumes, and only as the last step
+of an escalation (below).
+
+**GitLab's cleanup policies cannot remove multi-arch tags on this registry**, so the
+weekly GC pass untags old sha tags itself (`scripts/registry-prune-tags.sh`). The registry runs
+without its metadata database, and then GitLab ages a tag by the `created` field of
+the image config. A multi-arch image is an OCI index with no config, so it has no
+age, and a policy with `older_than` keeps it. backend/core's sha tags are all
+multi-arch: with keep 10 / older than 14d enabled on every project, it still had 375
+tags, and the cleanup worker re-queued itself on it about once a second with
+`deleted_size: 0`. The policies do clean the single-arch tags of other projects;
+what they leave behind there is, again, the multi-arch ones.
+
+What the script untags: tags named exactly like a short sha (`^[0-9a-f]{8}$`) that
+are neither among the `REGISTRY_TAG_KEEP_N` (10) newest in their repository nor
+pushed within `REGISTRY_TAG_RETENTION_DAYS` (14). `latest`, `master`, version tags
+and other named tags are never touched. It removes the tag's directory in storage,
+which is what the registry's own untag does; the manifest stays, so an image another
+tag points at is safe, and GC then collects what no tag references. See what it
+would remove without changing anything:
+
+```bash
+make registry-tags
+```
 
 When the disk fills, the registry starts answering `500 Internal Server Error` to
 `POST /v2/<image>/blobs/uploads/`. Pipelines then fail at the push step **with a
@@ -322,17 +348,26 @@ That writes `/etc/cron.d/gitlab-maintenance`:
 | When | What |
 |------|------|
 | Mon–Sat 03:30 | abandoned CI build containers (only with no CI job running), build cache unused for a day, unused images first tagged or pulled over a day ago, archived journals |
-| Sun 03:30 | the above plus registry garbage collection |
+| Sun 03:30 | the above plus old sha tags untagged and registry garbage collection |
+| every 15 min | disk alert to Telegram (see below) |
 
 Registry GC **stops** the registry for the duration, which is why it is weekly and
 at night: a push landing in that window fails its pipeline (retry it), though it
-cannot corrupt the storage. An interrupted GC (reboot, OOM) leaves the registry
-stopped — the same 500-on-push symptom as a full disk — so the script checks
-afterwards and starts it back up, shouting in the log if it cannot.
+cannot corrupt the storage. Tags are untagged inside that same window, with the
+registry already stopped, so no push can rewrite one while it goes. An interrupted
+GC (reboot, OOM) leaves the registry stopped — the same 500-on-push symptom as a
+full disk — so the script checks afterwards and starts it back up, shouting in the
+log if it cannot.
 
-Above 85% usage a run escalates to a 1-hour age filter instead of 24 hours, for
-build cache and images alike. It stays a filter rather than dropping to nothing: an
-image a pipeline built seconds ago has no container referencing it until it is
+Above 85% usage a run escalates, one step at a time and only while still over the
+line: first a 1-hour age filter instead of 24 hours for build cache and images;
+then, on a night that is not Sunday, the registry pass (tag pruning and GC); then
+the runner's cache volumes that no container uses — a cold cache for the next job of
+each project, nothing worse, since no pipeline here keeps correctness in them. If
+the disk is still over the line after all that, the run fails with "needs a human".
+
+The image filter stays a filter rather than dropping to nothing: an image a
+pipeline built seconds ago has no container referencing it until it is
 pushed, and sweeping it mid-pipeline would cause exactly the failure this script
 exists to prevent.
 
@@ -360,28 +395,55 @@ need" — it only keeps a just-built tag alive long enough to be pushed.
 Run it by hand at any time:
 
 ```bash
-make maintenance    # everything, including registry GC
-make registry-gc    # registry GC only
+make maintenance    # everything, including tag pruning and registry GC
+make registry-gc    # the same as make maintenance
 ```
 
-Log: `/var/log/gitlab-maintenance.log` (self-trimming at 10 MB).
+Log: `/var/log/gitlab-maintenance.log` (self-trimming at 10 MB). Registry GC's
+per-blob lines are filtered out of it; its stage summaries stay.
 
 A run prints its progress to stdout and appends it to the log. The cron entries
 redirect stdout to `/dev/null`, so a scheduled run is silent unless it fails —
 failures go to stderr and the exit code is non-zero, which is what makes cron
-mail (`MAILTO`, default `root`) mean something actually broke.
+mail (`MAILTO`, default `root`) mean something actually broke. **The GitLab host
+has no MTA, so that mail goes nowhere**; a run with failures also posts them to
+Telegram.
 
 Tune via environment variables: `IMAGE_RETENTION` (default `24h`),
 `ESCALATION_RETENTION` (`1h`), `BUILD_CONTAINER_RETENTION_HOURS` (`8`, a bare
 number of hours — not a docker duration string), `DISK_ESCALATE_PCT` (`85`),
-`MAINTENANCE_LOG`, `MAINTENANCE_LOCK`, `GITLAB_CONTAINER`. Set the cron recipient with
-`make install-cron MAINTENANCE_MAILTO=you@example.com`.
+`MAINTENANCE_LOG`, `MAINTENANCE_LOCK`, `GITLAB_CONTAINER`, `REGISTRY_TAG_KEEP_N`
+(`10`), `REGISTRY_TAG_RETENTION_DAYS` (`14`), `REGISTRY_REPOS` (registry storage
+path). Set the cron recipient with `make install-cron MAINTENANCE_MAILTO=you@example.com`.
 
-**Not covered by this script**, and worth doing separately: the root cause is that
-pipelines push only `:latest`, so every build orphans the previous manifest. Tagging
-by `$CI_COMMIT_SHA` plus a registry cleanup policy would leave GC almost nothing to
-do — and would give real rollback tags. Job artifacts and runner cache volumes also
-have no expiry.
+**Not covered by this script**, and worth doing separately: moving the registry to
+its metadata database. GitLab's cleanup policies would then age tags from the
+database and work for multi-arch images, and GC would run online instead of stopping
+the registry. It is a migration with a read-only window, not a config switch. Job
+artifacts also have no expiry here (748 MB on 2026-10-09).
+
+### Disk alert
+
+`scripts/disk-alert.sh` runs every 15 minutes and posts to the ops Telegram chat —
+the same bot and chat as production's Alertmanager — when `/` reaches 85% (warning)
+or 95% (critical), again every 6 hours while it stays at or above 85%, and once more
+when it falls back below 80%. Both times this disk filled, the first sign was a failed
+pipeline; this is meant to arrive days earlier.
+
+Credentials are two files under the gitignored `data/`, never in git:
+
+```bash
+sudo install -d -m 700 data/alerts
+# copy file to file from the host that runs Alertmanager — never paste the token
+sudo chmod 600 data/alerts/bot_token data/alerts/chat_id
+make disk-alert                                   # prints its decision, sends if due
+sudo ./scripts/notify-telegram.sh "test message"  # proves delivery
+```
+
+Without them both scripts still run; the message is not sent and the reason goes to
+stderr. Tune with `DISK_WARN_PCT` (85), `DISK_CRIT_PCT` (95), `DISK_ALERT_CLEAR_PCT`
+(80), `DISK_ALERT_REPEAT_HOURS` (6); state lives in
+`/var/lib/gitlab-disk-alert/state`.
 
 ## Troubleshooting
 

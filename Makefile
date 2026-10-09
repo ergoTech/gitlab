@@ -1,4 +1,4 @@
-.PHONY: help up down restart logs logs-gitlab logs-runner status ps clean backup restore get-password register-runner health registry-gc maintenance install-cron
+.PHONY: help up down restart logs logs-gitlab logs-runner status ps clean backup restore get-password register-runner health registry-gc registry-tags maintenance install-cron disk-alert
 
 # Default target
 .DEFAULT_GOAL := help
@@ -122,12 +122,18 @@ prune: ## Remove unused Docker resources
 
 registry-gc: maintenance ## Alias for maintenance (registry GC runs through the same lock)
 
+registry-tags: ## List the sha tags the next registry GC would untag (dry run, changes nothing)
+	sudo -E ./scripts/registry-prune-tags.sh --dry-run
+
+disk-alert: ## Run the disk alert check once: prints its decision, sends to Telegram if due
+	sudo -E ./scripts/disk-alert.sh
+
 maintenance: ## Run the full disk maintenance pass now (docker + journal + registry GC)
 	@echo "$(YELLOW)Running maintenance...$(NC)"
 	sudo -E ./scripts/maintenance.sh --with-registry-gc
 	@echo "$(GREEN)Maintenance complete!$(NC)"
 
-install-cron: ## Install the scheduled maintenance (daily docker cleanup, weekly registry GC)
+install-cron: ## Install the scheduled maintenance (daily docker cleanup, weekly registry GC, disk alert)
 	@echo "$(YELLOW)Installing /etc/cron.d/gitlab-maintenance...$(NC)"
 	@printf '%s\n' \
 		'# Disk maintenance for the GitLab host - installed by `make install-cron`.' \
@@ -140,9 +146,11 @@ install-cron: ## Install the scheduled maintenance (daily docker cleanup, weekly
 		'' \
 		'30 3 * * 1-6 root $(CURDIR)/scripts/maintenance.sh >/dev/null' \
 		'30 3 * * 0 root $(CURDIR)/scripts/maintenance.sh --with-registry-gc >/dev/null' \
+		'*/15 * * * * root $(CURDIR)/scripts/disk-alert.sh >/dev/null' \
 		'' | sudo tee /etc/cron.d/gitlab-maintenance > /dev/null
 	@sudo chmod 644 /etc/cron.d/gitlab-maintenance
 	@echo "$(GREEN)Installed. Schedule:$(NC)"
 	@echo "  Mon-Sat 03:30  docker cache + old images + journal"
-	@echo "  Sun     03:30  the above plus registry garbage collection"
+	@echo "  Sun     03:30  the above plus old sha tags untagged and registry garbage collection"
+	@echo "  every 15 min   disk alert to Telegram at 85% / 95%"
 	@echo "  Log: /var/log/gitlab-maintenance.log"
