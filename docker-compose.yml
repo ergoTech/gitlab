@@ -72,7 +72,29 @@ services:
         registry_nginx['enable'] = true
         registry_nginx['listen_port'] = ${GITLAB_REGISTRY_PORT:-5050}
         registry_nginx['listen_https'] = false
-        
+
+        # Registry metadata in a database: the bundled PostgreSQL, in the logical
+        # database `registry` that omnibus provisions from 18.3 on (same socket,
+        # peer auth as the OS user `registry`, so no password here). It is what
+        # lets cleanup policies age multi-arch tags, and what runs garbage
+        # collection online, so nothing stops the registry for GC any more.
+        #
+        # A registry that already holds images will not start with this on until
+        # its metadata has been imported, and must not be switched back to false
+        # once it has: README, "Registry metadata database", has the import, the
+        # rollback and why. A new install with an empty registry needs nothing
+        # beyond this line (GitLab's docs, 18.3 and later).
+        #
+        # If you ever add registry['storage'] while keeping this filesystem
+        # storage - for read-only mode, say - repeat
+        # 'filesystem' => { 'rootdirectory' => '/var/opt/gitlab/gitlab-rails/shared/registry' }
+        # in it: omnibus fills that default in only while registry['storage'] is
+        # unset, so a storage block without it leaves the registry with no
+        # storage driver at all.
+        registry['database'] = {
+          'enabled' => true,
+        }
+
         # Package Registry (npm, pypi, maven, etc.) - enabled by default
         gitlab_rails['packages_enabled'] = true
 

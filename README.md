@@ -278,14 +278,17 @@ docker compose up -d
 
 ### Disk maintenance
 
-Two things fill this host's disk and neither cleans up after itself:
+Two things have filled this host's disk. The script below handles the second; the
+first now cleans up after itself:
 
 - **The container registry.** Every pipeline pushes the same `:latest` tag, which
-  leaves the previous manifest untagged. Untagged manifests and their blobs are
-  never removed unless garbage collection runs with `-m`. Left alone this reached
-  41 GB here. Master builds also push a `:<short-sha>` tag, and a tagged image
-  is never collected at all: by 2026-10-08 the registry stood at 94 GB of a
-  145 GB disk.
+  leaves the previous manifest untagged, and master builds also push a
+  `:<short-sha>` tag. Without its metadata database the registry kept both:
+  untagged manifests until an offline GC that stops the registry, and sha tags for
+  good, because cleanup policies could not age multi-arch images. That reached
+  41 GB here, then 94 GB of a 145 GB disk by 2026-10-08. With the database
+  ([below](#registry-metadata-database)) the cleanup policies untag old tags and the
+  registry collects what nothing references online.
 - **The runner's Docker state.** Multiarch builds leave buildkit cache and an
   unreferenced image per pipeline — 14.85 GB of cache and 56.56 GB of images
   (507 images, 26 of them in use).
@@ -303,28 +306,6 @@ and only on a pass that finds no CI job running, while exited one-shots like
 cache behind an age filter, including when it escalates. The one exception to
 the named-volume rule is the runner's own cache volumes, and only as the last step
 of an escalation (below).
-
-**GitLab's cleanup policies cannot remove multi-arch tags on this registry**, so the
-weekly GC pass untags old sha tags itself (`scripts/registry-prune-tags.sh`). The registry runs
-without its metadata database, and then GitLab ages a tag by the `created` field of
-the image config. A multi-arch image is an OCI index with no config, so it has no
-age, and a policy with `older_than` keeps it. backend/core's sha tags are all
-multi-arch: with keep 10 / older than 14d enabled on every project, it still had 375
-tags, and the cleanup worker re-queued itself on it about once a second with
-`deleted_size: 0`. The policies do clean the single-arch tags of other projects;
-what they leave behind there is, again, the multi-arch ones.
-
-What the script untags: tags named exactly like a short sha (`^[0-9a-f]{8}$`) that
-are neither among the `REGISTRY_TAG_KEEP_N` (10) newest in their repository nor
-pushed within `REGISTRY_TAG_RETENTION_DAYS` (14). `latest`, `master`, version tags
-and other named tags are never touched. It removes the tag's directory in storage,
-which is what the registry's own untag does; the manifest stays, so an image another
-tag points at is safe, and GC then collects what no tag references. See what it
-would remove without changing anything:
-
-```bash
-make registry-tags
-```
 
 When the disk fills, the registry starts answering `500 Internal Server Error` to
 `POST /v2/<image>/blobs/uploads/`. Pipelines then fail at the push step **with a
@@ -347,24 +328,17 @@ That writes `/etc/cron.d/gitlab-maintenance`:
 
 | When | What |
 |------|------|
-| Mon–Sat 03:30 | abandoned CI build containers (only with no CI job running), build cache unused for a day, unused images first tagged or pulled over a day ago, archived journals |
-| Sun 03:30 | the above plus old sha tags untagged and registry garbage collection |
+| daily 03:30 | abandoned CI build containers (only with no CI job running), build cache unused for a day, unused images first tagged or pulled over a day ago, archived journals |
 | every 15 min | disk alert to Telegram (see below) |
-
-Registry GC **stops** the registry for the duration, which is why it is weekly and
-at night: a push landing in that window fails its pipeline (retry it), though it
-cannot corrupt the storage. Tags are untagged inside that same window, with the
-registry already stopped, so no push can rewrite one while it goes. An interrupted
-GC (reboot, OOM) leaves the registry stopped — the same 500-on-push symptom as a
-full disk — so the script checks afterwards and starts it back up, shouting in the
-log if it cannot.
 
 Above 85% usage a run escalates, one step at a time and only while still over the
 line: first a 1-hour age filter instead of 24 hours for build cache and images;
-then, on a night that is not Sunday, the registry pass (tag pruning and GC); then
-the runner's cache volumes that no container uses — a cold cache for the next job of
-each project, nothing worse, since no pipeline here keeps correctness in them. If
-the disk is still over the line after all that, the run fails with "needs a human".
+then the runner's cache volumes that no container uses — a cold cache for the next
+job of each project, nothing worse, since no pipeline here keeps correctness in them.
+If the disk is still over the line after all that, the run fails with "needs a
+human". The registry is not a step: its space comes back only when tags are deleted
+(cleanup policies, or the API), and online GC frees the blobs over the days after
+that ([below](#registry-metadata-database) has why it takes days).
 
 The image filter stays a filter rather than dropping to nothing: an image a
 pipeline built seconds ago has no container referencing it until it is
@@ -395,12 +369,10 @@ need" — it only keeps a just-built tag alive long enough to be pushed.
 Run it by hand at any time:
 
 ```bash
-make maintenance    # everything, including tag pruning and registry GC
-make registry-gc    # the same as make maintenance
+make maintenance
 ```
 
-Log: `/var/log/gitlab-maintenance.log` (self-trimming at 10 MB). Registry GC's
-per-blob lines are filtered out of it; its stage summaries stay.
+Log: `/var/log/gitlab-maintenance.log` (self-trimming at 10 MB).
 
 A run prints its progress to stdout and appends it to the log. The cron entries
 redirect stdout to `/dev/null`, so a scheduled run is silent unless it fails —
@@ -412,15 +384,162 @@ Telegram.
 Tune via environment variables: `IMAGE_RETENTION` (default `24h`),
 `ESCALATION_RETENTION` (`1h`), `BUILD_CONTAINER_RETENTION_HOURS` (`8`, a bare
 number of hours — not a docker duration string), `DISK_ESCALATE_PCT` (`85`),
-`MAINTENANCE_LOG`, `MAINTENANCE_LOCK`, `GITLAB_CONTAINER`, `REGISTRY_TAG_KEEP_N`
-(`10`), `REGISTRY_TAG_RETENTION_DAYS` (`14`), `REGISTRY_REPOS` (registry storage
-path). Set the cron recipient with `make install-cron MAINTENANCE_MAILTO=you@example.com`.
+`MAINTENANCE_LOG`, `MAINTENANCE_LOCK`. Set the cron recipient with
+`make install-cron MAINTENANCE_MAILTO=you@example.com`.
 
-**Not covered by this script**, and worth doing separately: moving the registry to
-its metadata database. GitLab's cleanup policies would then age tags from the
-database and work for multi-arch images, and GC would run online instead of stopping
-the registry. It is a migration with a read-only window, not a config switch. Job
-artifacts also have no expiry here (748 MB on 2026-10-09).
+**Not covered by this script**, and worth doing separately: job artifacts have no
+expiry here (748 MB on 2026-10-09).
+
+### Registry metadata database
+
+The registry keeps its metadata — repositories, tags, manifests — in the bundled
+PostgreSQL, in a logical database `registry` that omnibus provisions by itself from
+GitLab 18.3 on; `registry['database']` in `docker-compose.yml` turns it on. Image
+layers stay on the filesystem as before. Two things depend on it:
+
+- **Cleanup policies age multi-arch tags.** Without the database GitLab dates a tag
+  by the `created` field of its image config. A multi-arch image is an OCI index,
+  which has no config, so a policy with `older_than` never removed one: backend/core
+  kept 375 tags under a keep-10 / 14-day policy. With the database the tag's own
+  timestamps are used. The sidekiq log says which path a cleanup run took:
+  `"gitlab_cleanup_tags_service":true` with the database,
+  `"third_party_cleanup_tags_service":true` without.
+- **Garbage collection runs online.** A manifest that loses its last tag becomes
+  due for deletion a day later, and the blobs only it used a day after that, with
+  nothing stopped. Those are earliest times: a GC worker that finds nothing due
+  backs off exponentially between checks, up to 24 hours by default, so after a
+  quiet spell the next deletion can wait that much longer. `gitlab-ctl
+  registry-garbage-collect` refuses to run against a database-managed registry,
+  which is why `scripts/maintenance.sh` no longer calls it.
+
+A new install with an empty registry needs nothing more. A registry that already
+holds images does not start with the database on until its metadata has been
+imported — once, below — and from then on the database is the only record of what
+was pushed: switching it back off is the rollback further down, not a config change.
+Only tagged images are imported; an image that had lost its last tag can no longer
+be pulled by digest once the database is on.
+
+#### Importing an existing registry
+
+This is GitLab's one-step import, which its docs recommend where offline GC already
+runs regularly (three steps are for registries of 200 GiB and up). A dry run here on
+2026-10-09 — 11 repositories, 529 tags, 8,948 blobs, about 100 GB — took 61 seconds.
+The registry is down for the import plus a recreate of the `gitlab` container, and
+GitLab itself only for the recreate.
+
+Three things differ from GitLab's instructions on this setup:
+
+- the container has no `sudo`. Run the registry binary as the `registry` user with
+  `chpst` instead — that user is what peer authentication on the database socket
+  expects;
+- `gitlab-ctl registry-database import` is not used: for a full import it does not
+  check that the registry is read-only, and it starts the registry again on exit.
+  The registry is stopped by hand instead of being put in read-only mode, which
+  would need a `registry['storage']` block (see the warning next to
+  `registry['database']`) and one more restart;
+- the import gives every tag the import time as its creation time, so for
+  `older_than` (14 days) afterwards the policies find nothing old enough, and
+  `keep_n` cannot tell which imported tags are newest. Old sha tags are untagged
+  first by `scripts/registry-prune-tags.sh`, which still sees the real push times.
+  The blobs only they used are imported as unreferenced, and online GC removes them.
+
+Beforehand, with the database still off — the running registry does not touch it:
+
+```bash
+docker exec gitlab chpst -u registry /opt/gitlab/embedded/bin/registry database migrate up /var/opt/gitlab/registry/config.yml
+docker exec gitlab chpst -u registry /opt/gitlab/embedded/bin/registry database import --dry-run --row-count --log-to-stdout /var/opt/gitlab/registry/config.yml
+sudo ./scripts/registry-prune-tags.sh --dry-run
+```
+
+The dry run imports everything in one transaction and rolls it back. The time from
+its first log line to its last is the length of the import; the `duration_s` on the
+last line covers only the blob stage.
+
+The window, from this checkout, before pulling the commit that turns the database on.
+Keep it well clear of 03:30: until step 5 the nightly run is the old
+`scripts/maintenance.sh`, which on Sundays, and on any night the disk is past 85%,
+stops the registry for an offline GC and then starts it again.
+
+```bash
+REG=data/gitlab/data/gitlab-rails/shared/registry/docker/registry
+```
+
+1. Check that no CI job is running (`docker ps --format '{{.Names}}' | grep '^runner-'`
+   prints nothing) and no deploy is about to pull, then
+   `docker exec gitlab gitlab-ctl stop registry`.
+2. Keep the filesystem metadata as the rollback point, outside the checkout — it was
+   154 MB here on 2026-10-09; the blobs are not in it:
+   `sudo tar -czf /var/backups/registry-fs-metadata-$(date +%F).tgz -C "${REG:?}" v2/repositories lockfiles`
+3. `sudo ./scripts/registry-prune-tags.sh`
+4. The import: the dry-run command above without `--dry-run`. It ends with
+   `metadata import complete`, and `$REG/lockfiles/` then holds `database-in-use`
+   instead of `filesystem-in-use`. If it fails, what `$REG/lockfiles/` holds says
+   where it stopped:
+   - `filesystem-in-use`: it failed before its tags were all in and has put the
+     filesystem back in charge. `docker exec gitlab gitlab-ctl start registry`
+     and the registry runs as before. A second attempt needs the `tags` table
+     emptied first (GitLab's troubleshooting page, "cannot import all repositories
+     while the tags table has entries").
+   - `database-in-use`: repositories and tags are in; only the last stage failed,
+     the one that registers every blob on disk so online GC can review it. Run that
+     stage again — the import command with `--common-blobs` added, which is safe to
+     repeat — then go on to step 5. Skipping it leaves blobs no imported image uses
+     on disk for good: GC never sees them.
+5. `git pull --ff-only && docker compose up -d gitlab && make install-cron`. Once the
+   container is healthy, run `docker exec gitlab gitlab-ctl status registry` twice,
+   half a minute apart: the pid must be the same and its uptime growing. A single
+   `run:` proves nothing — a registry that cannot start (lockfiles, pending
+   migrations, no database connection) prints the reason as a plain line, with no
+   `level=` at all, and runit restarts it every second; the reason is at the end of
+   `/var/log/gitlab/registry/current` in the container. With `database-in-use` the
+   only lockfile, a registry that stays up is running on the database: on the
+   filesystem it refuses to start.
+
+Then check:
+
+- a pipeline that pushes a multi-arch image goes green, and
+  `docker buildx imagetools inspect <registry>/<group>/<project>:latest` lists its
+  platforms;
+- `docker exec gitlab gitlab-psql -d registry -Atc 'select count(*) from tags'`
+  matches the import's `tags=` count;
+- the next cleanup run logs `"gitlab_cleanup_tags_service":true`;
+- the GC queues: every imported blob and manifest is queued for review a day after
+  the import, and each worker takes one review roughly every 5 seconds while it has
+  work, so the registry shrinks over the following days.
+  `select count(*) from gc_blob_review_queue where review_after < now()` (in
+  `gitlab-psql -d registry`) jumps to roughly the blob count once that day is up and
+  should then fall steadily. If it sits flat for hours, the worker is still asleep
+  in its idle backoff from the empty first day: `docker exec gitlab gitlab-ctl
+  restart registry` starts it fresh. GitLab's docs ("Adjust blobs interval") show
+  how to shorten the interval if it has to go faster.
+
+`gitlab-backup` does not include this database. Dump it right after the import, next
+to the tarball:
+
+```bash
+sudo sh -c 'docker exec gitlab chpst -u gitlab-psql /opt/gitlab/embedded/bin/pg_dump -h /var/opt/gitlab/postgresql -Fc registry > /var/backups/registry-db-$(date +%F).dump' || echo "pg_dump FAILED - that file is not a backup"
+```
+
+The dump describes the registry only together with the blobs on disk at the same
+moment. Online GC keeps deleting blobs that later tag deletions free, so restoring an
+old dump brings back tags whose layers are gone. A real backup takes both at once.
+
+#### Rolling back
+
+- **Within a day of the import.** Every online-GC delay is at least a day, so
+  nothing has been deleted from storage yet. Revert the commit that turned the
+  database on, `docker exec gitlab gitlab-ctl stop registry`, delete
+  `"${REG:?}"/lockfiles/database-in-use`, extract the tarball over `$REG` —
+  `sudo tar -xzf /var/backups/registry-fs-metadata-<date>.tgz -C "${REG:?}"`, which
+  brings back `filesystem-in-use` and the sha tags step 3 removed — then
+  `docker compose up -d gitlab && make install-cron` — the reverted Makefile puts the
+  weekly offline GC back in cron. Images pushed since the import are not in the
+  filesystem metadata — re-run their pipelines.
+- **After that.** Online GC has begun deleting blobs the old metadata still points
+  at: the sha tags untagged before the import, and every `:latest` replaced since.
+  Rolling back then also means untagging those sha tags again, re-running every
+  pipeline that pushes `:latest`, and an offline GC. Treat the switch as one-way
+  after the first day.
 
 ### Disk alert
 
